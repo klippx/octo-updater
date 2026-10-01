@@ -407,6 +407,26 @@ class LutrisProbeLifecycleTests(unittest.TestCase):
         thread.assert_called_once()
         thread.return_value.start.assert_called_once_with()
 
+    def test_play_state_executable_info_does_not_offer_retry(self):
+        app = object.__new__(octo_updater.OctoUpdaterApp)
+        app._game_path = mock.Mock()
+        app._game_path.get.return_value = "/games/wrath/drive_c/wow"
+        app._lutris_state = {
+            "selected": {"id": "4", "name": "Wrath"},
+        }
+
+        with mock.patch.object(
+                octo_updater, "load_config", return_value={}), \
+                mock.patch("tkinter.messagebox.showinfo") as showinfo:
+            app._show_lutris_executable_info()
+
+        showinfo.assert_called_once()
+        title, text = showinfo.call_args.args
+        self.assertEqual(title, "Verify Lutris executable")
+        self.assertIn("PLAY will launch Wrath through Lutris", text)
+        self.assertIn("No retry is needed", text)
+        self.assertNotIn("Retry Lutris detection", text)
+
 
 class LaunchBehaviorTests(unittest.TestCase):
     @staticmethod

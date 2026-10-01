@@ -5950,7 +5950,7 @@ class OctoUpdaterApp(tk.Tk):
             fg=C_TEXT_DIM, bg=C_BG, cursor="arrow", anchor="w")
         self._launcher_note.place(x=0, y=self._px(8))
         self._launcher_note.bind(
-            "<Button-1>", lambda e: self._show_posix_launch_help()
+            "<Button-1>", lambda e: self._show_lutris_executable_info()
             if self._launcher_note.cget("text") else None)
 
         tk.Label(foot, text=f"v{UPDATER_VERSION}",
@@ -6855,6 +6855,24 @@ class OctoUpdaterApp(tk.Tk):
             parent=self)
         if retry and sys.platform.startswith("linux"):
             self._start_lutris_probe(force=True)
+
+    def _show_lutris_executable_info(self):
+        from tkinter import messagebox
+        client_dir = self._game_path.get().strip()
+        _, exe_lbl = selected_game_executable(client_dir, load_config())
+        selected = self._lutris_state.get("selected") or {}
+        game_label = selected.get("name") or "the matched Lutris entry"
+        messagebox.showinfo(
+            "Verify Lutris executable",
+            f"PLAY will launch {game_label} through Lutris.\n\n"
+            "Octo Updater cannot inspect the executable saved in Lutris. "
+            f"Open this entry's Game options and verify it launches {exe_lbl} "
+            f"from:\n\n{client_dir}\n\n"
+            "VanillaFixes.exe is required to load installed mod DLLs when it "
+            "is available. No retry is needed after changing only the "
+            "executable because Lutris discovery checks the entry and game "
+            "directory, not its executable.",
+            parent=self)
 
     def _launch_game(self):
         """Launch through the native Windows path or a matched Lutris entry.
