@@ -4,6 +4,8 @@ mods, tweaks and addons. Standard library, optional 'certifi' for TLS;
 Python 3.10+.
 """
 
+from __future__ import annotations
+
 import json
 import hashlib
 import os
@@ -20,6 +22,8 @@ import time
 import math
 import threading
 import queue
+import signal
+import uuid
 from functools import cache
 import tkinter as tk
 from tkinter import filedialog
@@ -82,6 +86,8 @@ def _default_app_data_dir() -> str:
 APP_DATA_DIR = _default_app_data_dir()
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "config.json")
+VERIFY_TRANSACTION_POINTER = os.path.join(
+    APP_DATA_DIR, "active-verify-transaction.json")
 
 # First-run default game folder, anchored to the app dir (not the CWD).
 DEFAULT_GAME_DIR = os.path.join(APP_DIR, "OctoWoW")
@@ -544,68 +550,263 @@ def _torrent_skip(parts, ignore_speech: bool, client_dir: str) -> bool:
     return False
 
 
-# Files the sync must not rewrite (mod-owned client-root files, plus a kept
-# custom speech.MPQ). Excluding them from --select-file stops aria2 fetching
-# them on their own, but a torrent piece can straddle a file boundary, so
-# repairing a selected neighbour re-downloads the shared piece and rewrites the
-# excluded file's bytes too. We move them aside (rename) for the sync and put
-# them back — instant and RAM-free, unlike copying a large speech.MPQ.
-_SHIELD_SUFFIX = ".octobak"
+# Selected pieces can cross into excluded mod files. Keep those files in a
+# journaled, per-run directory while aria2 owns the live paths. Recovery follows
+# only the journal; legacy/user-created .octobak files are never inferred.
+_VERIFY_TRANSACTION_VERSION = 1
+_VERIFY_TRANSACTION_PREFIX = ".octo-verify-"
 
 
-def shield_protected_files(client_dir: str, files, ignore_speech: bool) -> list:
-    """Prepare each sync-protected file (see _torrent_skip) for the sync. An
-    existing one is moved aside via a same-dir rename; an absent one is recorded
-    with backup=None, because the sync must never create it (only the Mods tab
-    installs these) yet aria2 may write a partial stub for it through a shared
-    piece. Returns [(orig, backup_or_None)] for unshielding."""
-    shielded = []
-    for parts, _length in files:
-        if not _torrent_skip(parts, ignore_speech, client_dir):
-            continue
-        p = os.path.join(client_dir, *parts)
-        if os.path.exists(p):
-            bak = p + _SHIELD_SUFFIX
-            try:
-                os.replace(p, bak)      # same-fs, instant; aria2 sees p missing
-                shielded.append((p, bak))
-            except OSError:
-                pass
-        else:
-            shielded.append((p, None))  # must stay absent afterwards
-    return shielded
+def _write_json_atomic(path: str, data: dict):
+    ensure_dir(os.path.dirname(path))
+    _atomic_write(path, json.dumps(data, indent=2, sort_keys=True))
 
 
-def unshield_protected_files(shielded) -> list:
-    """Move each shielded file back, or delete the stub the sync created for a
-    file that was absent before. Returns the basenames restored."""
-    restored = []
-    for p, bak in shielded:
-        if bak is None:
-            try:
-                os.remove(p)            # drop aria2's partial stub; stay absent
-            except OSError:
-                pass
-            continue
+def _validate_transaction_id(value: str) -> str:
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{32}", value):
+        raise RuntimeError("invalid Verify transaction ID")
+    return value
+
+
+def _validate_client_relative_path(value: str) -> str:
+    if not isinstance(value, str) or not value or "\x00" in value:
+        raise RuntimeError("invalid empty Verify transaction path")
+    if os.path.isabs(value):
+        raise RuntimeError(f"unsafe absolute Verify transaction path: {value!r}")
+    normalized = os.path.normpath(value)
+    parts = Path(normalized).parts
+    if normalized != value or not parts or any(p in ("", ".", "..") for p in parts):
+        raise RuntimeError(f"unsafe Verify transaction path: {value!r}")
+    return normalized
+
+
+def _transaction_client_path(client_root: str, relative: str) -> str:
+    relative = _validate_client_relative_path(relative)
+    root = os.path.realpath(client_root)
+    target = os.path.abspath(os.path.join(root, relative))
+    if os.path.commonpath((root, target)) != root:
+        raise RuntimeError(f"Verify transaction path escapes game folder: {relative!r}")
+    parent = root
+    for part in Path(relative).parts[:-1]:
+        parent = os.path.join(parent, part)
+        if os.path.lexists(parent) and stat.S_ISLNK(os.lstat(parent).st_mode):
+            raise RuntimeError(
+                f"Verify transaction path has a symlinked parent: {relative!r}")
+    return target
+
+
+class VerifyShieldTransaction:
+    """Durable rollback for the small set Verify mutates outside aria2 resume."""
+
+    def __init__(self, client_dir: str, log_fn=log,
+                 pointer_path: str | None = None,
+                 transaction_id: str | None = None):
+        self.client_root = os.path.realpath(os.path.abspath(client_dir))
+        self.id = _validate_transaction_id(transaction_id or uuid.uuid4().hex)
+        self.transaction_dir = os.path.join(
+            self.client_root, _VERIFY_TRANSACTION_PREFIX + self.id)
+        self.backup_dir = os.path.join(self.transaction_dir, "backups")
+        self.journal_path = os.path.join(self.transaction_dir, "journal.json")
+        self.pointer_path = pointer_path or VERIFY_TRANSACTION_POINTER
+        self.log_fn = log_fn
+        self.data = {
+            "version": _VERIFY_TRANSACTION_VERSION,
+            "id": self.id,
+            "client_root": self.client_root,
+            "state": "PREPARING",
+            "entries": [],
+            "wow": None,
+        }
+
+    def _save(self):
+        _write_json_atomic(self.journal_path, self.data)
+
+    def _save_pointer(self):
+        _write_json_atomic(self.pointer_path, {
+            "version": _VERIFY_TRANSACTION_VERSION,
+            "id": self.id,
+            "client_root": self.client_root,
+        })
+
+    def _backup_path(self, entry: dict) -> str:
+        name = _validate_client_relative_path(entry["backup"])
+        path = os.path.abspath(os.path.join(self.transaction_dir, name))
+        if os.path.commonpath((self.transaction_dir, path)) != self.transaction_dir:
+            raise RuntimeError("Verify backup path escapes transaction directory")
+        parent = os.path.dirname(path)
+        if os.path.lexists(parent) and stat.S_ISLNK(os.lstat(parent).st_mode):
+            raise RuntimeError("Verify backup directory is a symlink")
+        return path
+
+    def begin(self, files, ignore_speech: bool, pristine_wow: str | None = None):
+        if os.path.lexists(self.transaction_dir):
+            raise RuntimeError("Verify transaction directory already exists")
+        os.makedirs(self.backup_dir)
+
+        protected = []
+        for parts, _length in files:
+            if not _torrent_skip(parts, ignore_speech, self.client_root):
+                continue
+            if any(not isinstance(p, str) or not p or os.sep in p
+                   or (os.altsep and os.altsep in p) for p in parts):
+                raise RuntimeError(f"unsafe torrent path components: {parts!r}")
+            relative = _validate_client_relative_path(os.path.join(*parts))
+            path = _transaction_client_path(self.client_root, relative)
+            if os.path.lexists(path) and stat.S_ISLNK(os.lstat(path).st_mode):
+                raise RuntimeError(f"refusing to shield symlink: {relative}")
+            protected.append({
+                "path": relative,
+                "existed": os.path.exists(path),
+                "backup": os.path.join("backups", f"{len(protected):04d}.bak"),
+                "state": "planned",
+            })
+        self.data["entries"] = protected
+        self._save()
+        self._save_pointer()
+        self.log_fn(
+            f"Verify shield {self.id} started: protected={len(protected)}, "
+            f"executable_backup={'yes' if pristine_wow else 'no'}", "dim")
+
+        self.data["state"] = "SHIELDING"
+        self._save()
+        for entry in self.data["entries"]:
+            path = _transaction_client_path(self.client_root, entry["path"])
+            entry["state"] = "move_pending"
+            self._save()
+            if entry["existed"]:
+                os.replace(path, self._backup_path(entry))
+                self.log_fn(f"  shielded {entry['path']}", "dim")
+            entry["state"] = "shielded"
+            self._save()
+
+        if pristine_wow:
+            wow_path = _transaction_client_path(self.client_root, "WoW.exe")
+            if not os.path.isfile(wow_path) or os.path.islink(wow_path):
+                raise RuntimeError("cannot safely back up WoW.exe")
+            wow = {
+                "path": "WoW.exe",
+                "backup": os.path.join("backups", "WoW.exe.bak"),
+                "state": "copy_pending",
+            }
+            self.data["wow"] = wow
+            self._save()
+            tmp = self._backup_path(wow) + ".tmp"
+            with open(wow_path, "rb") as src, open(tmp, "wb") as dst:
+                shutil.copyfileobj(src, dst)
+                dst.flush()
+                os.fsync(dst.fileno())
+            os.replace(tmp, self._backup_path(wow))
+            wow["state"] = "backup_ready"
+            self._save()
+            shutil.copyfile(pristine_wow, wow_path)
+            wow["state"] = "replaced"
+            self._save()
+
+        self.data["state"] = "RUNNING"
+        self._save()
+
+    def restore_protected(self) -> list:
+        self.data["state"] = "RESTORING"
+        self._save()
+        restored = []
+        for entry in self.data["entries"]:
+            path = _transaction_client_path(self.client_root, entry["path"])
+            backup = self._backup_path(entry)
+            if entry["existed"]:
+                if os.path.exists(backup):
+                    os.replace(backup, path)
+                elif not os.path.exists(path):
+                    raise RuntimeError(f"missing Verify backup: {entry['path']}")
+                restored.append(os.path.basename(path))
+            elif os.path.lexists(path):
+                if os.path.isdir(path) and not os.path.islink(path):
+                    raise RuntimeError(
+                        f"refusing to remove unexpected directory: {entry['path']}")
+                os.remove(path)
+            entry["state"] = "restored"
+            self._save()
+        return restored
+
+    def _restore_wow(self):
+        wow = self.data.get("wow")
+        if not wow or wow.get("state") in ("restored", "committed"):
+            return
+        backup = self._backup_path(wow)
+        path = _transaction_client_path(self.client_root, wow["path"])
+        if os.path.exists(backup):
+            os.replace(backup, path)
+        elif not os.path.exists(path):
+            raise RuntimeError("missing Verify backup: WoW.exe")
+        wow["state"] = "restored"
+        self._save()
+        self.log_fn("Restored pre-Verify WoW.exe.", "dim")
+
+    def _clear(self, final_state: str):
+        self.data["state"] = final_state
+        self._save()
         try:
-            os.replace(bak, p)          # our version wins over aria2's partial
-            restored.append(os.path.basename(p))
-        except OSError:
+            with open(self.pointer_path) as f:
+                pointer = json.load(f)
+            if pointer.get("id") == self.id:
+                os.remove(self.pointer_path)
+        except FileNotFoundError:
             pass
-    return restored
+        shutil.rmtree(self.transaction_dir)
+
+    def commit(self):
+        self.restore_protected()
+        wow = self.data.get("wow")
+        if wow:
+            wow["state"] = "committed"
+        self._clear("COMMITTED")
+        self.log_fn(f"Verify shield {self.id} committed.", "dim")
+
+    def rollback(self):
+        self.log_fn(f"Restoring Verify shield {self.id}…", "acct")
+        restored = self.restore_protected()
+        self._restore_wow()
+        self._clear("ROLLED_BACK")
+        self.log_fn(
+            f"Verify shield {self.id} rolled back: restored={len(restored)}.",
+            "dim")
+
+    @classmethod
+    def from_pointer(cls, pointer_path: str | None = None,
+                     log_fn=log):
+        pointer_path = pointer_path or VERIFY_TRANSACTION_POINTER
+        with open(pointer_path) as f:
+            pointer = json.load(f)
+        if pointer.get("version") != _VERIFY_TRANSACTION_VERSION:
+            raise RuntimeError("unsupported Verify transaction version")
+        transaction_id = _validate_transaction_id(pointer.get("id"))
+        client_root = pointer.get("client_root")
+        if not isinstance(client_root, str) or not os.path.isabs(client_root):
+            raise RuntimeError("invalid Verify transaction game folder")
+        client_root = os.path.realpath(client_root)
+        tx = cls(client_root, log_fn=log_fn, pointer_path=pointer_path,
+                 transaction_id=transaction_id)
+        if os.path.realpath(tx.transaction_dir) != tx.transaction_dir:
+            raise RuntimeError("Verify transaction directory is a symlink")
+        with open(tx.journal_path) as f:
+            data = json.load(f)
+        if (data.get("version") != _VERIFY_TRANSACTION_VERSION
+                or data.get("id") != transaction_id
+                or os.path.realpath(data.get("client_root", "")) != client_root):
+            raise RuntimeError("Verify transaction journal does not match pointer")
+        tx.data = data
+        return tx
 
 
-def recover_protected_files(client_dir: str, files):
-    """Undo a shield interrupted by a crash: an orphaned '.octobak' beside a
-    torrent file is the real file — move it back into place."""
-    for parts, _length in files:
-        p   = os.path.join(client_dir, *parts)
-        bak = p + _SHIELD_SUFFIX
-        if os.path.exists(bak):
-            try:
-                os.replace(bak, p)
-            except OSError:
-                pass
+def recover_interrupted_verify(
+        pointer_path: str | None = None, log_fn=log) -> bool:
+    pointer_path = pointer_path or VERIFY_TRANSACTION_POINTER
+    if not os.path.exists(pointer_path):
+        return False
+    tx = VerifyShieldTransaction.from_pointer(pointer_path, log_fn=log_fn)
+    log_fn(f"Interrupted Verify detected; recovering {tx.id}…", "acct")
+    tx.rollback()
+    log_fn("Interrupted Verify recovery completed.", "ok")
+    return True
 
 
 def torrent_selection(client_dir: str, files, drop_mismatched=False,
@@ -916,16 +1117,38 @@ _active_aria2_lock = threading.Lock()
 
 
 def stop_aria2c():
-    """Terminate the running aria2c child, if any. Safe to call from any thread
-    (e.g. the app's close handler)."""
-    global _active_aria2
+    """Request termination without stealing wait()/cleanup from the worker."""
     with _active_aria2_lock:
-        proc, _active_aria2 = _active_aria2, None
+        proc = _active_aria2
     if proc and proc.poll() is None:
         try:
-            proc.terminate()
-        except Exception:
-            pass
+            if sys.platform != "win32":
+                os.killpg(proc.pid, signal.SIGTERM)
+            else:
+                proc.terminate()
+        except (OSError, ProcessLookupError):
+            return
+
+
+def _stop_aria2c_and_wait(proc, log_fn, grace_seconds=3.0):
+    if proc.poll() is not None:
+        return
+    log_fn(f"Cancellation requested; stopping aria2 PID {proc.pid}…", "dim")
+    stop_aria2c()
+    try:
+        proc.wait(timeout=grace_seconds)
+        log_fn("aria2 terminated.", "dim")
+        return
+    except subprocess.TimeoutExpired:
+        log_fn("aria2 did not stop in time; forcing termination.", "err")
+    try:
+        if sys.platform != "win32":
+            os.killpg(proc.pid, signal.SIGKILL)
+        else:
+            proc.kill()
+    except (OSError, ProcessLookupError):
+        pass
+    proc.wait(timeout=grace_seconds)
 
 
 def run_aria2c(client_dir, select_files=None, check_integrity=False,
@@ -982,15 +1205,39 @@ def run_aria2c(client_dir, select_files=None, check_integrity=False,
     }
     if sys.platform == "win32":
         popen_kwargs["creationflags"] = _NO_WINDOW
+    else:
+        popen_kwargs["start_new_session"] = True
 
     proc = subprocess.Popen(args, **popen_kwargs)
     with _active_aria2_lock:
         _active_aria2 = proc
+    lines = queue.Queue()
+
+    def _read_output():
+        try:
+            for output_line in proc.stdout:
+                lines.put(output_line)
+        finally:
+            lines.put(None)
+
+    threading.Thread(target=_read_output, daemon=True).start()
+    cancelled = False
     try:
-        for line in proc.stdout:
+        stream_open = True
+        while stream_open:
             if should_cancel and should_cancel():
-                proc.terminate()
-                raise RuntimeError("Cancelled")
+                cancelled = True
+                _stop_aria2c_and_wait(proc, log_fn)
+                break
+            try:
+                line = lines.get(timeout=0.1)
+            except queue.Empty:
+                if proc.poll() is not None:
+                    break
+                continue
+            if line is None:
+                stream_open = False
+                continue
             line = line.strip()
             if not line:
                 continue
@@ -1011,10 +1258,14 @@ def run_aria2c(client_dir, select_files=None, check_integrity=False,
             proc.stdout.close()
         except Exception:
             pass
+        if proc.poll() is None:
+            proc.wait()
         with _active_aria2_lock:
             if _active_aria2 is proc:
                 _active_aria2 = None
-    code = proc.wait()
+    code = proc.returncode
+    if cancelled:
+        raise RuntimeError("Cancelled")
     if code != 0:
         raise RuntimeError(f"aria2c exited with code {code}")
 
@@ -1075,7 +1326,9 @@ class UpdateWorker:
         self.out_dir = out_dir
         self.log_q   = log_q
         self.prog_q  = prog_q
-        self._cancel = False
+        self._cancel = threading.Event()
+        self.completed = threading.Event()
+        self.safe_to_exit = True
         # Integrity mode: aria2 hash-checks every file's pieces and repairs
         # them (catches same-size corruption size-based selection misses).
         self.check_integrity  = check_integrity
@@ -1083,7 +1336,7 @@ class UpdateWorker:
         self.overwrite_config = overwrite_config
 
     def cancel(self):
-        self._cancel = True
+        self._cancel.set()
 
     def log(self, msg: str, tag: str = ""):
         self.log_q.put((msg, tag))
@@ -1178,11 +1431,14 @@ class UpdateWorker:
     def run(self):
         # The selection is recomputed here from the live torrent so an
         # interrupted sync always resumes against the current file set.
+        transaction = None
         try:
             self.log("\nStarting client sync…\n", "acct")
             self.progress(0.0, "Preparing…")
             raw, files = fetch_torrent()
             version = torrent_version(raw)
+            if self._cancel.is_set():
+                raise RuntimeError("Cancelled")
 
             # aria2's saved control state pins a torrent revision and its
             # completed pieces. When the torrent was re-rolled (new identity) or
@@ -1204,20 +1460,6 @@ class UpdateWorker:
             if self.overwrite_config or not os.path.exists(cfg_wtf):
                 write_config_wtf(self.out_dir)
 
-            # WoW.exe on disk is patched, so an integrity check always flags it
-            # and re-fetches its pieces over the network. Restore the cached
-            # pristine base first: the check then passes with no re-download when
-            # the client is unchanged (aria2 still repairs it if the torrent's
-            # WoW.exe genuinely changed). It's re-patched after the check.
-            wow_path = os.path.join(self.out_dir, "WoW.exe")
-            if (self.check_integrity and os.path.exists(PRISTINE_WOW_PATH)
-                    and os.path.exists(wow_path)):
-                shutil.copyfile(PRISTINE_WOW_PATH, wow_path)
-
-            # Put back any file a prior run shielded but couldn't restore (crash
-            # mid-sync), so its version isn't stranded as a .octobak.
-            recover_protected_files(self.out_dir, files)
-
             # speech.MPQ is left unverified/un-updated when the user keeps a
             # custom one (Settings → Ignore speech.mpq).
             ignore_speech = bool(load_config().get("ignore_speech", False))
@@ -1237,6 +1479,8 @@ class UpdateWorker:
             wow_downloaded = any(files[i - 1][0] == ["WoW.exe"] for i in need)
 
             if need:
+                if self._cancel.is_set():
+                    raise RuntimeError("Cancelled")
                 self.log(
                     (f"Verifying {len(need)} file(s) via torrent…"
                      if self.check_integrity
@@ -1262,36 +1506,37 @@ class UpdateWorker:
                             _phase["status"] = status = want
                     self.progress(min(frac, 1.0), label, status)
 
-                # Excluded files (mod-owned + kept speech.MPQ) can still be
-                # rewritten by aria2 through a shared torrent piece. Move them
-                # aside for the sync and put them back after, so the Mods tab /
-                # custom speech stays authoritative.
-                shielded = shield_protected_files(self.out_dir, files,
-                                                  ignore_speech)
+                pristine_wow = None
+                wow_path = os.path.join(self.out_dir, "WoW.exe")
+                if (self.check_integrity and os.path.exists(PRISTINE_WOW_PATH)
+                        and os.path.exists(wow_path)):
+                    pristine_wow = PRISTINE_WOW_PATH
+                transaction = VerifyShieldTransaction(
+                    self.out_dir, log_fn=self.log)
+                transaction.begin(
+                    files, ignore_speech, pristine_wow=pristine_wow)
                 try:
                     run_aria2c(self.out_dir, select_files=need,
                                check_integrity=self.check_integrity,
                                on_progress=_prog,
-                               should_cancel=lambda: self._cancel,
+                               should_cancel=self._cancel.is_set,
                                log_fn=self.log)
                 finally:
-                    for name in unshield_protected_files(shielded):
+                    for name in transaction.restore_protected():
                         self.log(f"  kept mod file: {name}", "dim")
             else:
                 self.log("All game files already present.", "dim")
 
-            if self._cancel:
+            if self._cancel.is_set():
                 self.log("\nUpdate cancelled.", "err")
                 self.progress(0.0, "Cancelled")
-                self.log_q.put(("__ERROR__", ""))
-                return
+                raise RuntimeError("Cancelled")
 
             self.progress(1.0, "Verifying…")
             if not torrent_tree_intact(self.out_dir, files,
                                        ignore_speech=ignore_speech):
                 self.log("\n✗  Download incomplete — click Update to finish.", "err")
-                self.log_q.put(("__ERROR__", ""))
-                return
+                raise RuntimeError("Download incomplete")
 
             self.log("\nDownload complete.", "ok")
             remove_wdb(self.out_dir)
@@ -1317,12 +1562,23 @@ class UpdateWorker:
                 self.log_q.put((f"__VERSION__{client_ver}", ""))
             else:
                 self.log("Could not read client version from WoW.exe", "dim")
+            if transaction is not None:
+                transaction.commit()
             self.log_q.put(("__DONE__", ""))
 
         except Exception as e:
+            if transaction is not None:
+                try:
+                    transaction.rollback()
+                except Exception as recovery_error:
+                    self.safe_to_exit = False
+                    self.log(
+                        f"\n✗  Verify recovery failed: {recovery_error}", "err")
             self.log(f"\n✗  {e}", "err")
             self.progress(0.0, "")
             self.log_q.put(("__ERROR__", ""))
+        finally:
+            self.completed.set()
 
 
 def write_config_wtf(client_dir: str, tweaks: dict | None = None):
@@ -2959,6 +3215,12 @@ class OctoUpdaterApp(tk.Tk):
         # the user just added it themselves.
         self._av_excluded = False
         self._cfg        = load_config()
+        self._recovery_error = None
+        try:
+            recover_interrupted_verify()
+        except Exception as e:
+            self._recovery_error = str(e)
+            log(f"Interrupted Verify recovery failed: {e}", "err")
         # Pending reconcile mode (None = none): _offer_reconcile surfaces the
         # Update button and the Update the user clicks runs an integrity pass
         # instead of a routine size-based sync. "full" also writes a fresh
@@ -2969,6 +3231,8 @@ class OctoUpdaterApp(tk.Tk):
         # to date. PLAY is gated on this AND on no mod being in an error state.
         self._client_ready = False
         self._worker: UpdateWorker | None = None
+        self._worker_thread: threading.Thread | None = None
+        self._closing = False
         self._log_q:  queue.Queue = queue.Queue()
         self._prog_q: queue.Queue = queue.Queue()
         # Session log lives in memory; the "Show logs" window renders it.
@@ -3031,6 +3295,14 @@ class OctoUpdaterApp(tk.Tk):
         self.geometry(f"{WIN_W}x{WIN_H}+{x}+{y}")
 
         self._build()
+
+        if self._recovery_error:
+            self.protocol("WM_DELETE_WINDOW", self._on_close)
+            self._poll()
+            self._status_var.set("Recovery failed — check the log")
+            self._set_btn_busy("RECOVERY FAILED")
+            self.deiconify()
+            return
 
         out_dir = self._cfg.get("out_dir", DEFAULT_GAME_DIR)
         if not os.path.exists(out_dir):
@@ -3098,17 +3370,36 @@ class OctoUpdaterApp(tk.Tk):
     # ── build ─────────────────────────────────────────────────────────────────
 
     def _on_close(self):
-        """Hide the window first so the close feels instant
-        Config/caches are already saved at write time,
-        and the worker threads are daemons, so nothing blocks the exit."""
-        try:
-            self.withdraw()
-        except Exception:
-            pass
-        # A download's aria2c child isn't a daemon thread — kill it explicitly
-        # so it can't keep syncing headless after the window is gone.
+        if self._closing:
+            return
+        worker = self._worker
+        if worker is None or worker.completed.is_set():
+            self.destroy()
+            return
+        self._closing = True
+        self._status_var.set("Restoring game files…")
+        self._set_btn_busy("Restoring…")
+        self._prog_label_var.set("Cancelling Verify safely…")
+        self._log_line(
+            "\nClose requested — restoring game files before exit.\n", "acct")
+        worker.cancel()
         stop_aria2c()
-        self.quit()
+        self.after(100, self._finish_close)
+
+    def _finish_close(self):
+        worker = self._worker
+        if worker is not None and not worker.completed.is_set():
+            self.after(100, self._finish_close)
+            return
+        if worker is not None and not worker.safe_to_exit:
+            self._status_var.set("Recovery failed — check the log")
+            self._set_btn_busy("RECOVERY FAILED")
+            self._prog_label_var.set("Game files were not fully restored")
+            self._log_line(
+                "Verify recovery failed; Octo Updater will remain open.\n",
+                "err")
+            return
+        self.destroy()
 
     def _add_tooltip(self, widget, text: str):
         """Attach a small hover tooltip to a widget."""
@@ -6543,6 +6834,7 @@ class OctoUpdaterApp(tk.Tk):
                                       overwrite_config=overwrite_config)
 
         t = threading.Thread(target=self._worker.run, daemon=True)
+        self._worker_thread = t
         t.start()
 
     def _finish(self, success: bool):
@@ -6669,4 +6961,7 @@ def _enable_dpi_awareness():
 if __name__ == "__main__":
     _enable_dpi_awareness()
     app = OctoUpdaterApp()
+    if sys.platform != "win32":
+        signal.signal(signal.SIGTERM, lambda _sig, _frame: app.after(
+            0, app._on_close))
     app.mainloop()
