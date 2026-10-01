@@ -66,6 +66,13 @@ def _default_app_data_dir() -> str:
         path = os.path.join(xdg_config, "octo-updater")
         try:
             os.makedirs(path, exist_ok=True)
+            old_config = os.path.join(APP_DIR, "config.json")
+            new_config = os.path.join(path, "config.json")
+            if os.path.exists(old_config) and not os.path.exists(new_config):
+                try:
+                    shutil.move(old_config, new_config)
+                except OSError:
+                    return APP_DIR
             return path
         except OSError:
             pass
@@ -80,72 +87,21 @@ CONFIG_FILE = os.path.join(APP_DATA_DIR, "config.json")
 DEFAULT_GAME_DIR = os.path.join(APP_DIR, "OctoWoW")
 
 
-def _read_config_file(path: str):
-    try:
-        with open(path, encoding="utf-8") as f:
-            value = json.load(f)
-        return value if isinstance(value, dict) else None
-    except (OSError, ValueError):
-        return None
-
-
-def _reconcile_config_file(old: str, new: str):
-    """Move a legacy config into persistent storage.
-
-    If both files exist, the newest valid atomic snapshot wins. This matters
-    when an early persistent-config build created the destination before an
-    older build subsequently updated addon commit records beside the app.
-    """
-    if os.path.abspath(old) == os.path.abspath(new) or not os.path.exists(old):
-        return None
-    try:
-        if not os.path.exists(new):
-            shutil.move(old, new)
-            return "moved"
-
-        old_cfg = _read_config_file(old)
-        new_cfg = _read_config_file(new)
-        if old_cfg is None:
-            return "legacy-invalid"
-        if new_cfg is None or os.path.getmtime(old) > os.path.getmtime(new):
-            # The app directory and XDG config directory can be on different
-            # filesystems. Copy beside the destination, then atomically replace
-            # it rather than relying on a cross-device rename.
-            tmp = new + ".migrate"
-            shutil.copy2(old, tmp)
-            os.replace(tmp, new)
-            os.remove(old)
-            return "legacy-newer"
-
-        os.remove(old)
-        return "persistent-newer"
-    except OSError:
-        return "failed"
-
-
 def _relocate_legacy_data():
-    # Pre-persistent builds wrote config.json beside the app; still older
-    # builds used octo_updater_config.json. Reconcile every candidate because
-    # two app versions may have alternated after the XDG config was created.
-    old_name = "octo_updater_config.json"
-    candidates = (os.path.join(APP_DIR, old_name),
-                  os.path.join(APP_DIR, "config.json"),
-                  os.path.join(APP_DATA_DIR, old_name))
-    for old in candidates:
-        result = _reconcile_config_file(old, CONFIG_FILE)
-        if result == "moved":
-            log("Migrated legacy configuration to persistent storage.", "dim")
-        elif result == "legacy-newer":
-            log("Recovered newer addon/settings state from legacy configuration.",
-                "acct")
-        elif result == "persistent-newer":
-            log("Removed stale legacy configuration copy.", "dim")
-        elif result == "legacy-invalid":
-            log("Legacy configuration is invalid; persistent state was kept.",
-                "err")
-        elif result == "failed":
-            log("Could not reconcile legacy and persistent configuration.",
-                "err")
+    # Old config (<1.3: octo_updater_config.json beside the app) becomes
+    # config.json in APP_DATA_DIR. Rename + relocate, only when the old name
+    # exists and the new path doesn't (idempotent). The legacy game-hash cache
+    # is no longer used and is deleted by _migrate_1_3.
+    old_name, new = "octo_updater_config.json", CONFIG_FILE
+    for old in (os.path.join(APP_DIR, old_name),
+                os.path.join(APP_DATA_DIR, old_name)):
+        if old == new or not os.path.exists(old) or os.path.exists(new):
+            continue
+        try:
+            shutil.move(old, new)
+            break
+        except OSError:
+            pass
 
 # News tab: the latest announcement (forum 2, full post) fills the left panel,
 # the patch-notes list (forum 4) fills the right.
