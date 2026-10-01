@@ -311,15 +311,17 @@ def _lutris_candidate_label(game) -> str:
     )
 
 
-def matching_lutris_games(raw_json: str, client_dir: str,
-                          diagnostics: list[str] | None = None) -> list[dict]:
-    """Validate Lutris JSON and return Wine entries for exactly client_dir."""
+def _lutris_match_candidates(
+        raw_json: str, client_dir: str,
+        diagnostics: list[str] | None = None) -> tuple[list[dict], list[dict]]:
+    """Return exact JSON-directory matches and safe fallback candidates."""
     games = json.loads(raw_json)
     if not isinstance(games, list):
         raise ValueError("Lutris returned JSON that is not a game list")
 
     wanted = _normalized_real_path(client_dir)
-    matches = []
+    exact_matches = []
+    fallback_candidates = []
     rejections = []
     for game in games:
         label = _lutris_candidate_label(game)
@@ -340,14 +342,22 @@ def matching_lutris_games(raw_json: str, client_dir: str,
         candidate = _normalized_real_path(directory)
         if candidate != wanted:
             rejections.append(
-                f"{label}: rejected (normalized directory mismatch: "
-                f"target={wanted!r}, candidate={candidate!r})")
+                f"{label}: JSON directory mismatch "
+                f"(target={wanted!r}, candidate={candidate!r}); "
+                "trying output-script executable fallback")
+            fallback_candidates.append({
+                "id": game_id,
+                "name": str(game.get("name") or f"Lutris game {game_id}"),
+                "runner": "wine",
+                "directory": directory,
+            })
             continue
-        matches.append({
+        exact_matches.append({
             "id": game_id,
             "name": str(game.get("name") or f"Lutris game {game_id}"),
             "runner": "wine",
             "directory": directory,
+            "match_source": "json-directory",
         })
     if diagnostics is not None:
         diagnostics.extend(rejections[:LUTRIS_LOG_REJECTION_LIMIT])
@@ -355,31 +365,77 @@ def matching_lutris_games(raw_json: str, client_dir: str,
             diagnostics.append(
                 f"{len(rejections) - LUTRIS_LOG_REJECTION_LIMIT} additional "
                 "rejected entries omitted")
+    return exact_matches, fallback_candidates
+
+
+def matching_lutris_games(raw_json: str, client_dir: str,
+                          diagnostics: list[str] | None = None) -> list[dict]:
+    """Validate Lutris JSON and return exact JSON-directory Wine matches."""
+    matches, _ = _lutris_match_candidates(
+        raw_json, client_dir, diagnostics=diagnostics)
+    for game in matches:
+        game.pop("match_source", None)
     return matches
+
+
+def lutris_script_inspection(script: str) -> dict:
+    """Safely inspect the command in a generated Lutris launch script."""
+    marker = "# Command"
+    if marker not in script:
+        return {
+            "classification": None, "executable_path": None,
+            "executable_parent": None, "reason": "missing # Command marker",
+        }
+    command_lines = [line.strip() for line in script.split(marker, 1)[1].splitlines()
+                     if line.strip() and not line.lstrip().startswith("#")]
+    if not command_lines:
+        return {
+            "classification": None, "executable_path": None,
+            "executable_parent": None, "reason": "missing command line",
+        }
+    try:
+        args = shlex.split(command_lines[0])
+    except ValueError as e:
+        return {
+            "classification": None, "executable_path": None,
+            "executable_parent": None,
+            "reason": f"command could not be parsed: {e}",
+        }
+    executable_args = []
+    for arg in args:
+        name = arg.replace("\\", "/").rsplit("/", 1)[-1].casefold()
+        if name in {"vanillafixes.exe", "wow.exe"}:
+            executable_args.append((arg, name))
+    if len(executable_args) != 1:
+        reason = ("no supported game executable in command"
+                  if not executable_args
+                  else "multiple supported game executables in command")
+        return {
+            "classification": None, "executable_path": None,
+            "executable_parent": None, "reason": reason,
+        }
+    executable_path, name = executable_args[0]
+    classification = "vanillafixes" if name == "vanillafixes.exe" else "wow"
+    if not os.path.isabs(executable_path):
+        return {
+            "classification": classification,
+            "executable_path": executable_path,
+            "executable_parent": None,
+            "reason": "game executable path is relative; no safe working "
+                      "directory basis was found",
+        }
+    normalized_path = _normalized_real_path(executable_path)
+    return {
+        "classification": classification,
+        "executable_path": normalized_path,
+        "executable_parent": os.path.dirname(normalized_path),
+        "reason": None,
+    }
 
 
 def lutris_script_executable(script: str) -> str | None:
     """Return vanillafixes/wow when a generated Lutris script is unambiguous."""
-    marker = "# Command"
-    if marker not in script:
-        return None
-    command_lines = [line.strip() for line in script.split(marker, 1)[1].splitlines()
-                     if line.strip() and not line.lstrip().startswith("#")]
-    if not command_lines:
-        return None
-    try:
-        args = shlex.split(command_lines[0])
-    except ValueError:
-        return None
-    names = {
-        arg.replace("\\", "/").rsplit("/", 1)[-1].casefold()
-        for arg in args
-    }
-    has_vf = "vanillafixes.exe" in names
-    has_wow = "wow.exe" in names
-    if has_vf == has_wow:
-        return None
-    return "vanillafixes" if has_vf else "wow"
+    return lutris_script_inspection(script)["classification"]
 
 
 def lutris_launcher_note(expected_exe: str,
@@ -404,12 +460,16 @@ def lutris_launch_command(lutris: str, game_id: str) -> list[str]:
     return [lutris, f"lutris:rungameid/{game_id}"]
 
 
-def inspect_lutris_executable(lutris: str, game_id: str) -> str | None:
+def inspect_lutris_game(lutris: str, game_id: str) -> dict:
     """Best-effort inspection of Lutris's generated script; never executes it."""
+    inconclusive = {
+        "classification": None, "executable_path": None,
+        "executable_parent": None, "reason": "inspection failed",
+    }
     if not game_id.isdecimal():
         log(f"[Lutris] Output-script inspection skipped for invalid ID "
             f"{game_id!r}.", "dim")
-        return None
+        return inconclusive
     argv = [lutris, "--output-script", game_id]
     log(f"[Lutris] Inspecting game ID {game_id}; running (no shell): "
         f"{argv!r}", "dim")
@@ -424,33 +484,56 @@ def inspect_lutris_executable(lutris: str, game_id: str) -> str | None:
                 log(f"[Lutris] Output-script inspection for ID {game_id} "
                     f"failed with exit code {result.returncode}"
                     f"{f': {detail}' if detail else '.'}", "dim")
-                return None
+                return {
+                    **inconclusive,
+                    "reason": f"output-script exited with {result.returncode}",
+                }
             entries = list(Path(tmp).iterdir())
             if (len(entries) != 1 or entries[0].is_symlink()
                     or not stat.S_ISREG(entries[0].stat().st_mode)):
                 log(f"[Lutris] Output-script inspection for ID {game_id} was "
                     "inconclusive: expected one regular non-symlink file, "
                     f"found {len(entries)} entries.", "dim")
-                return None
+                return {
+                    **inconclusive,
+                    "reason": "output-script did not create exactly one safe "
+                              "regular file",
+                }
             if entries[0].stat().st_size > LUTRIS_SCRIPT_MAX_BYTES:
                 log(f"[Lutris] Output-script inspection for ID {game_id} was "
                     f"inconclusive: generated file exceeds "
                     f"{LUTRIS_SCRIPT_MAX_BYTES} bytes.", "dim")
-                return None
-            classification = lutris_script_executable(
+                return {
+                    **inconclusive,
+                    "reason": "generated script exceeded the size limit",
+                }
+            inspection = lutris_script_inspection(
                 entries[0].read_text(encoding="utf-8", errors="replace"))
+            reason_detail = (
+                f", reason={inspection['reason']}"
+                if inspection["reason"] else "")
             log(f"[Lutris] Output-script inspection for ID {game_id}: "
                 f"executable classification="
-                f"{classification or 'inconclusive'}.", "dim")
-            return classification
+                f"{inspection['classification'] or 'inconclusive'}, "
+                f"executable path="
+                f"{inspection['executable_path'] or 'inconclusive'}, "
+                f"parent={inspection['executable_parent'] or 'inconclusive'}"
+                f"{reason_detail}.",
+                "dim")
+            return inspection
     except subprocess.TimeoutExpired:
         log(f"[Lutris] Output-script inspection for ID {game_id} timed out "
             f"after {LUTRIS_TIMEOUT}s.", "dim")
-        return None
+        return {**inconclusive, "reason": "output-script timed out"}
     except (OSError, subprocess.SubprocessError) as e:
         log(f"[Lutris] Output-script inspection for ID {game_id} failed: "
             f"{_bounded_log_detail(str(e))}", "dim")
-        return None
+        return {**inconclusive, "reason": str(e)}
+
+
+def inspect_lutris_executable(lutris: str, game_id: str) -> str | None:
+    """Compatibility wrapper returning only executable classification."""
+    return inspect_lutris_game(lutris, game_id)["classification"]
 
 
 def discover_lutris_games(client_dir: str) -> dict:
@@ -481,16 +564,40 @@ def discover_lutris_games(client_dir: str) -> dict:
                 f"{result.returncode}{f': {detail}' if detail else '.'}", "err")
             raise RuntimeError(message)
         diagnostics = []
-        matches = matching_lutris_games(
+        matches, fallback_candidates = _lutris_match_candidates(
             result.stdout, client_dir, diagnostics=diagnostics)
         games = json.loads(result.stdout)
         log(f"[Lutris] Installed entries returned: {len(games)}.", "dim")
         for detail in diagnostics:
             log(f"[Lutris] Candidate {_bounded_log_detail(detail)}", "dim")
-        log(f"[Lutris] Exact normalized directory matches: {len(matches)}.",
+        log(f"[Lutris] Exact normalized JSON directory matches: "
+            f"{len(matches)}.",
             "dim")
+        target = _normalized_real_path(client_dir)
         for game in matches:
-            game["executable"] = inspect_lutris_executable(lutris, game["id"])
+            inspection = inspect_lutris_game(lutris, game["id"])
+            game["executable"] = inspection["classification"]
+        for game in fallback_candidates:
+            inspection = inspect_lutris_game(lutris, game["id"])
+            game["executable"] = inspection["classification"]
+            parent = inspection["executable_parent"]
+            if parent == target:
+                game["match_source"] = "output-script-executable"
+                matches.append(game)
+                log(f"[Lutris] Candidate ID {game['id']} accepted via "
+                    f"output-script executable parent: target={target!r}, "
+                    f"parent={parent!r}.", "ok")
+            elif parent:
+                log(f"[Lutris] Candidate ID {game['id']} rejected after "
+                    f"output-script inspection: executable parent mismatch "
+                    f"(target={target!r}, parent={parent!r}).", "dim")
+            else:
+                log(f"[Lutris] Candidate ID {game['id']} rejected after "
+                    f"output-script inspection: "
+                    f"{inspection['reason'] or 'executable parent was inconclusive'}.",
+                    "dim")
+        log(f"[Lutris] Total accepted matches after executable fallback: "
+            f"{len(matches)}.", "dim")
         log(f"[Lutris] Discovery finished: ready, {len(matches)} exact "
             f"match{'es' if len(matches) != 1 else ''}.", "dim")
         return {"status": "ready", "matches": matches, "lutris": lutris}
@@ -6899,13 +7006,14 @@ class OctoUpdaterApp(tk.Tk):
             return
         retry = messagebox.askretrycancel(
             "Launching the game",
-            "Octo Updater can use an existing Lutris game entry whose "
-            "directory exactly matches this game folder:\n\n"
+            "Octo Updater can use an existing Wine-runner Lutris entry whose "
+            "game directory or configured executable resolves to this game "
+            "folder:\n\n"
             f"{client_dir}\n\n"
-            "In Lutris, add a locally installed Windows game, set its game "
-            f"directory to the folder above, and set its executable to "
-            f"{exe_lbl}. VanillaFixes.exe is required to load installed mod "
-            "DLLs when it is available.\n\n"
+            "In Lutris, add a locally installed Windows game and set its "
+            f"executable to the absolute path of {exe_lbl} in the folder "
+            "above. VanillaFixes.exe is required to load installed mod DLLs "
+            "when it is available.\n\n"
             "You can also keep launching the game manually through Steam, "
             "Proton, Bottles, Wine, or another launcher.\n\n"
             "Retry Lutris detection now?",
