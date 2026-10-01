@@ -783,9 +783,9 @@ def read_pristine_wow(client_dir: str) -> bytes:
 
 
 def _ensure_torrent_junction(client_dir: str) -> str:
-    """Point <staging>/client at client_dir via an NTFS junction (no admin) so
-    aria2 writes the torrent's files straight into the real client dir. Returns
-    the staging dir to pass as aria2 --dir."""
+    """Point <staging>/client at client_dir via an NTFS junction (no admin) or
+    symlink (POSIX) so aria2 writes the torrent's files straight into the real
+    client dir. Returns the staging dir to pass as aria2 --dir."""
     staging = TORRENT_STAGING_DIR
     ensure_dir(staging)
     link   = os.path.join(staging, TORRENT_NAME)
@@ -796,6 +796,7 @@ def _ensure_torrent_junction(client_dir: str) -> str:
             return staging
     except OSError:
         pass
+
     # remove a stale junction/link (rmdir drops the reparse point, not its
     # target's contents) then recreate it
     try:
@@ -805,11 +806,21 @@ def _ensure_torrent_junction(client_dir: str) -> str:
             os.remove(link)
         except OSError:
             pass
-    r = subprocess.run(["cmd", "/c", "mklink", "/J", link, target],
-                       capture_output=True, text=True, creationflags=_NO_WINDOW)
-    if not os.path.isdir(link):
-        raise RuntimeError("could not create download junction: "
-                           + (r.stderr or r.stdout or "").strip())
+
+    if sys.platform == "win32":
+        # Windows: Use mklink /J for NTFS junction (requires no admin rights)
+        r = subprocess.run(["cmd", "/c", "mklink", "/J", link, target],
+                           capture_output=True, text=True, creationflags=_NO_WINDOW)
+        if not os.path.isdir(link):
+            raise RuntimeError("could not create download junction: "
+                               + (r.stderr or r.stdout or "").strip())
+    else:
+        # POSIX (Linux/macOS): Use native Python symlink mapping
+        try:
+            os.symlink(target, link, target_is_directory=True)
+        except OSError as e:
+            raise RuntimeError(f"could not create download symlink: {e}")
+
     return staging
 
 
