@@ -195,12 +195,22 @@ wine 'Z:\\\\games\\\\OctoWoW\\\\WoW.exe'
 
 
 class LutrisDiscoveryTests(unittest.TestCase):
+    @staticmethod
+    def _messages(log_mock):
+        return "\n".join(call.args[0] for call in log_mock.call_args_list)
+
     def test_reports_missing_lutris(self):
-        with mock.patch.object(octo_updater.shutil, "which", return_value=None):
+        with mock.patch.object(
+                octo_updater.shutil, "which", return_value=None), \
+                mock.patch.object(octo_updater, "log") as logger:
             result = octo_updater.discover_lutris_games("/games/OctoWoW")
 
         self.assertEqual(result["status"], "missing")
         self.assertEqual(result["matches"], [])
+        messages = self._messages(logger)
+        self.assertIn("normalized game directory: /games/OctoWoW", messages)
+        self.assertIn("'lutris' was not found", messages)
+        self.assertIn("missing tool, 0 exact matches", messages)
 
     def test_discovers_and_inspects_exact_matches(self):
         with tempfile.TemporaryDirectory() as client_dir:
@@ -238,18 +248,116 @@ class LutrisDiscoveryTests(unittest.TestCase):
                 return_value="/usr/bin/lutris"), \
                 mock.patch.object(
                     octo_updater.subprocess, "run",
-                    side_effect=subprocess.TimeoutExpired(["lutris"], 10)):
+                    side_effect=subprocess.TimeoutExpired(["lutris"], 10)), \
+                mock.patch.object(octo_updater, "log") as timeout_logger:
             timeout = octo_updater.discover_lutris_games("/games/OctoWoW")
         self.assertEqual(timeout["status"], "error")
+        self.assertIn(
+            "discovery timed out after 10s",
+            self._messages(timeout_logger).lower(),
+        )
 
         completed = subprocess.CompletedProcess(["lutris"], 0, "{", "")
         with mock.patch.object(
                 octo_updater.shutil, "which",
                 return_value="/usr/bin/lutris"), \
                 mock.patch.object(
-                    octo_updater.subprocess, "run", return_value=completed):
+                    octo_updater.subprocess, "run", return_value=completed), \
+                mock.patch.object(octo_updater, "log") as malformed_logger:
             malformed = octo_updater.discover_lutris_games("/games/OctoWoW")
         self.assertEqual(malformed["status"], "error")
+        messages = self._messages(malformed_logger)
+        self.assertIn("Malformed or unexpected JSON output", messages)
+        self.assertIn("probe error, 0 exact matches", messages)
+
+    def test_logs_no_match_runner_and_path_rejections(self):
+        payload = json.dumps([
+            {
+                "id": 41,
+                "name": "Wrong runner",
+                "runner": "linux",
+                "directory": "/games/OctoWoW",
+            },
+            {
+                "id": 42,
+                "name": "Wrong folder",
+                "runner": "wine",
+                "directory": "/games/AnotherWoW",
+            },
+            {
+                "id": "not-numeric",
+                "name": "Bad ID",
+                "runner": "wine",
+                "directory": "/games/OctoWoW",
+            },
+        ])
+        completed = subprocess.CompletedProcess(["lutris"], 0, payload, "")
+        with mock.patch.object(
+                octo_updater.shutil, "which",
+                return_value="/usr/bin/lutris"), \
+                mock.patch.object(
+                    octo_updater.subprocess, "run", return_value=completed), \
+                mock.patch.object(octo_updater, "log") as logger:
+            result = octo_updater.discover_lutris_games("/games/OctoWoW")
+
+        self.assertEqual(result["status"], "ready")
+        self.assertEqual(result["matches"], [])
+        messages = self._messages(logger)
+        self.assertIn("Installed entries returned: 3", messages)
+        self.assertIn("runner is not literal 'wine'", messages)
+        self.assertIn("name='Wrong runner'", messages)
+        self.assertIn("normalized directory mismatch", messages)
+        self.assertIn("target='/games/OctoWoW'", messages)
+        self.assertIn("candidate='/games/AnotherWoW'", messages)
+        self.assertIn("ID is not numeric", messages)
+        self.assertIn("Exact normalized directory matches: 0", messages)
+        self.assertIn("ready, 0 exact matches", messages)
+
+    def test_logs_unexpected_json_shape(self):
+        completed = subprocess.CompletedProcess(["lutris"], 0, "{}", "")
+        with mock.patch.object(
+                octo_updater.shutil, "which",
+                return_value="/usr/bin/lutris"), \
+                mock.patch.object(
+                    octo_updater.subprocess, "run", return_value=completed), \
+                mock.patch.object(octo_updater, "log") as logger:
+            result = octo_updater.discover_lutris_games("/games/OctoWoW")
+
+        self.assertEqual(result["status"], "error")
+        self.assertIn(
+            "JSON that is not a game list",
+            self._messages(logger),
+        )
+
+
+class LutrisProbeLifecycleTests(unittest.TestCase):
+    def test_retry_logs_cache_invalidation_and_starts_fresh_probe(self):
+        app = object.__new__(octo_updater.OctoUpdaterApp)
+        app._game_path = mock.Mock()
+        app._game_path.get.return_value = "/games/OctoWoW"
+        app._lutris_state = {
+            "status": "ready",
+            "path": "/games/OctoWoW",
+            "matches": [],
+            "selected": None,
+        }
+        app._lutris_probe_token = 4
+        app._log_line = mock.Mock()
+        app._set_btn_busy = mock.Mock()
+        app._status_var = mock.Mock()
+
+        with mock.patch.object(octo_updater.threading, "Thread") as thread:
+            app._start_lutris_probe(force=True)
+
+        app._log_line.assert_called_once()
+        self.assertIn(
+            "Retry requested; invalidating cached discovery state",
+            app._log_line.call_args.args[0],
+        )
+        self.assertEqual(app._lutris_state["status"], "probing")
+        self.assertEqual(app._lutris_probe_token, 5)
+        thread.assert_called_once()
+        thread.return_value.start.assert_called_once_with()
 
 
 class LaunchBehaviorTests(unittest.TestCase):
