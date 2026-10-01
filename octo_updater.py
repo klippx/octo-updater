@@ -2678,6 +2678,11 @@ def fov_default_for_display() -> int:
 
 
 def _get_display_info_safe() -> dict:
+    import sys
+    if sys.platform != "win32":
+        # Safe fallback for Linux/macOS
+        return {"width": 1920, "height": 1080, "refresh_rate": 60}
+
     import ctypes
     ENUM_CURRENT_SETTINGS = -1
 
@@ -6064,11 +6069,18 @@ class OctoUpdaterApp(tk.Tk):
         self._verify_game_files()
 
     def _allow_through_antivirus(self):
-        """Add a Windows Defender exclusion for the game folder (asks for
-        admin elevation via UAC)."""
         client_dir = os.path.normpath(self._game_path.get().strip())
         if not client_dir or client_dir == ".":
             return
+
+        import sys
+        if sys.platform != "win32":
+            self._av_excluded = True
+            self._log_line("Antivirus exclusion skipped (not required on this OS).\n", "ok")
+            return
+
+        """Add a Windows Defender exclusion for the game folder (asks for
+        admin elevation via UAC)."""
         import ctypes
         cmd = f"Add-MpPreference -ExclusionPath '{client_dir}'"
         r = ctypes.windll.shell32.ShellExecuteW(
@@ -6544,10 +6556,15 @@ def _enable_dpi_awareness():
     reports the true DPI (letting us scale crisply) instead of bitmap-scaling a
     96-DPI render. Prefers Per-Monitor-V2, falling back through older contexts.
     Must run before the Tk root exists; a no-op off Windows / on old Windows."""
+    import sys
+    if sys.platform != "win32":
+        return
+
     try:
         import ctypes
     except Exception:
         return
+
     user32 = getattr(ctypes, "windll", None) and ctypes.windll.user32
     if user32 is not None:
         # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4, PER_MONITOR = -3.
