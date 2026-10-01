@@ -339,8 +339,8 @@ if sys.platform == "win32":
 else:
     # On POSIX, resolve the system-installed binary
     ARIA2C_PATH = shutil.which("aria2c")
-    if not ARIA2C_PATH and os.path.exists("/home/linuxbrew/.linuxbrew/bin/aria2c"):
-        ARIA2C_PATH = "/home/linuxbrew/.linuxbrew/bin/aria2c"
+    if not ARIA2C_PATH:
+        ARIA2C_PATH = shutil.which("/home/linuxbrew/.linuxbrew/bin/aria2c")
 
 # The torrent's top-level folder name: aria2 writes files under <dir>/<name>/…,
 # so a junction <staging>/client → the real client dir lands them in place.
@@ -405,7 +405,11 @@ def ensure_aria2c(log_fn=log) -> str:
     # --- Linux / macOS path ---
     if sys.platform != "win32":
         if not ARIA2C_PATH:
-            raise RuntimeError("aria2c not found in PATH. Please install it natively (e.g., 'brew install aria2').")
+            raise RuntimeError(
+                "aria2c not found in PATH. Install it with "
+                "'sudo apt install aria2' on Debian/Ubuntu, "
+                "'sudo dnf install aria2' on Fedora, or "
+                "'brew install aria2' with Homebrew.")
         log_fn("aria2c ready.", "ok")
         return ARIA2C_PATH
 
@@ -1308,7 +1312,6 @@ def write_config_wtf(client_dir: str, tweaks: dict | None = None):
         "gxWindow": 1, "gxMaximize": 1,
         "gxVSync": 0,
         "gxColorBits": 24, "gxDepthBits": 24,
-        "gxRefresh": di["refresh_rate"],
         "gxMultisampleQuality": 0, "gxMultisample": 2,
         "hwDetect": 0,
         "pixelShaders": 1, "M2UsePixelShaders": 1,
@@ -1361,6 +1364,8 @@ def write_config_wtf(client_dir: str, tweaks: dict | None = None):
         "NP_ChatBubblesBattleground": 1,
         "ChatBubblesParty": 1,
     }
+    if di.get("refresh_rate"):
+        vars_["gxRefresh"] = di["refresh_rate"]
     try:
         cfg_dir = os.path.join(client_dir, "WTF")
         ensure_dir(cfg_dir)
@@ -2703,9 +2708,22 @@ def fov_default_for_display() -> int:
 
 
 def _get_display_info_safe() -> dict:
-    import sys
     if sys.platform != "win32":
-        # Safe fallback for Linux/macOS
+        root = tk._default_root
+        owns_root = root is None
+        try:
+            if owns_root:
+                root = tk.Tk()
+                root.withdraw()
+            width = int(root.winfo_screenwidth())
+            height = int(root.winfo_screenheight())
+            if width > 0 and height > 0:
+                return {"width": width, "height": height, "refresh_rate": None}
+        except tk.TclError:
+            pass
+        finally:
+            if owns_root and root is not None:
+                root.destroy()
         return {"width": 1920, "height": 1080, "refresh_rate": 60}
 
     import ctypes
@@ -5963,8 +5981,9 @@ class OctoUpdaterApp(tk.Tk):
 
         _titem("✓", "Verify game files", self._settings_verify)
         _titem("☰", "Show logs", self._show_logs)
-        _titem("⛊", "Add game folder to Defender exclusions",
-               self._allow_through_antivirus)
+        if sys.platform == "win32":
+            _titem("⛊", "Add game folder to Defender exclusions",
+                   self._allow_through_antivirus)
 
         tk.Label(lcol, text="SUPPORT THE DEVELOPER",
                  font=("Segoe UI", 10, "bold"),
@@ -6058,10 +6077,10 @@ class OctoUpdaterApp(tk.Tk):
                 self._auto_addons_retrigger = False
                 self._install_missing_recommended_addons()
 
-        # Offer a Defender exclusion at each reconcile, unless the user already
-        # added one via Settings since the last reconcile. Reset after, so a
-        # later reconcile (e.g. another folder change) offers it again.
-        if needs_reconcile:
+        # Offer a Defender exclusion at each Windows reconcile, unless the user
+        # already added one via Settings since the last reconcile. Reset after,
+        # so a later reconcile (e.g. another folder change) offers it again.
+        if needs_reconcile and sys.platform == "win32":
             if not self._av_excluded:
                 self._prompt_av_exclusion()
             self._av_excluded = False
@@ -6094,18 +6113,17 @@ class OctoUpdaterApp(tk.Tk):
         self._verify_game_files()
 
     def _allow_through_antivirus(self):
+        """Add a Windows Defender exclusion for the game folder (asks for
+        admin elevation via UAC)."""
         client_dir = os.path.normpath(self._game_path.get().strip())
         if not client_dir or client_dir == ".":
             return
 
-        import sys
         if sys.platform != "win32":
             self._av_excluded = True
             self._log_line("Antivirus exclusion skipped (not required on this OS).\n", "ok")
             return
 
-        """Add a Windows Defender exclusion for the game folder (asks for
-        admin elevation via UAC)."""
         import ctypes
         cmd = f"Add-MpPreference -ExclusionPath '{client_dir}'"
         r = ctypes.windll.shell32.ShellExecuteW(
@@ -6123,7 +6141,8 @@ class OctoUpdaterApp(tk.Tk):
         aria2c downloader may trigger a Windows Firewall prompt — so it doesn't
         look sketchy to a non-technical user. Purely informational; tracked in
         the config so it appears only once."""
-        if self._cfg.get("aria2_firewall_notice_shown"):
+        if (sys.platform != "win32"
+                or self._cfg.get("aria2_firewall_notice_shown")):
             return
         from tkinter import messagebox
         messagebox.showinfo(
