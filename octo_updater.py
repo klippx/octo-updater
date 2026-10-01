@@ -4,13 +4,17 @@ mods, tweaks and addons. Standard library, optional 'certifi' for TLS;
 Python 3.10+.
 """
 
+from __future__ import annotations
+
 import json
 import hashlib
 import os
 import sys
 import ssl
 import re
+import shlex
 import subprocess
+import tempfile
 import urllib.request
 from urllib.parse import urlsplit
 import shutil
@@ -34,6 +38,8 @@ SERVER           = "https://octowow.st"
 UA               = f"OctoUpdater/{UPDATER_VERSION}"
 DOWNLOAD_RETRY   = 5
 DOWNLOAD_TIMEOUT = 10    # seconds without any data before a transfer aborts
+LUTRIS_TIMEOUT   = 10
+LUTRIS_SCRIPT_MAX_BYTES = 256 * 1024
 
 # Where the app lives: next to the .exe when frozen (PyInstaller), otherwise
 # next to this script — never the current working directory, which varies with
@@ -271,6 +277,139 @@ def update_config(mutator):
         mutator(cfg)
         save_config(cfg)
         return cfg
+
+
+def selected_game_executable(client_dir: str, cfg: dict) -> tuple[str, str]:
+    """Return the executable OctoUpdater expects the launcher to use."""
+    vf_state = cfg.get("mods", {}).get("VanillaFixes", {})
+    vf_path = os.path.join(client_dir, "VanillaFixes.exe")
+    if (vf_state.get("enabled") and vf_state.get("installed_version")
+            and os.path.exists(vf_path)):
+        return vf_path, "VanillaFixes.exe"
+    return os.path.join(client_dir, "WoW.exe"), "WoW.exe"
+
+
+def _normalized_real_path(path: str) -> str:
+    return os.path.normcase(os.path.realpath(os.path.expanduser(path)))
+
+
+def matching_lutris_games(raw_json: str, client_dir: str) -> list[dict]:
+    """Validate Lutris JSON and return Wine entries for exactly client_dir."""
+    games = json.loads(raw_json)
+    if not isinstance(games, list):
+        raise ValueError("Lutris returned JSON that is not a game list")
+
+    wanted = _normalized_real_path(client_dir)
+    matches = []
+    for game in games:
+        if not isinstance(game, dict) or game.get("runner") != "wine":
+            continue
+        game_id = str(game.get("id", ""))
+        directory = game.get("directory")
+        if (not game_id.isdecimal() or not isinstance(directory, str)
+                or _normalized_real_path(directory) != wanted):
+            continue
+        matches.append({
+            "id": game_id,
+            "name": str(game.get("name") or f"Lutris game {game_id}"),
+            "runner": "wine",
+            "directory": directory,
+        })
+    return matches
+
+
+def lutris_script_executable(script: str) -> str | None:
+    """Return vanillafixes/wow when a generated Lutris script is unambiguous."""
+    marker = "# Command"
+    if marker not in script:
+        return None
+    command_lines = [line.strip() for line in script.split(marker, 1)[1].splitlines()
+                     if line.strip() and not line.lstrip().startswith("#")]
+    if not command_lines:
+        return None
+    try:
+        args = shlex.split(command_lines[0])
+    except ValueError:
+        return None
+    names = {
+        arg.replace("\\", "/").rsplit("/", 1)[-1].casefold()
+        for arg in args
+    }
+    has_vf = "vanillafixes.exe" in names
+    has_wow = "wow.exe" in names
+    if has_vf == has_wow:
+        return None
+    return "vanillafixes" if has_vf else "wow"
+
+
+def lutris_launcher_note(expected_exe: str,
+                         actual_exe: str | None) -> tuple[str, bool]:
+    """Return footer guidance and whether it represents a verified mismatch."""
+    if expected_exe != "VanillaFixes.exe":
+        return "", False
+    if actual_exe == "wow":
+        return (
+            "Lutris launches WoW.exe; use VanillaFixes.exe to load mods "
+            "— Fix in Lutris",
+            True,
+        )
+    if actual_exe is None:
+        return "Lutris executable not verified — How to check", False
+    return "", False
+
+
+def lutris_launch_command(lutris: str, game_id: str) -> list[str]:
+    if not game_id.isdecimal():
+        raise ValueError("Lutris game ID must be numeric")
+    return [lutris, f"lutris:rungameid/{game_id}"]
+
+
+def inspect_lutris_executable(lutris: str, game_id: str) -> str | None:
+    """Best-effort inspection of Lutris's generated script; never executes it."""
+    if not game_id.isdecimal():
+        return None
+    try:
+        with tempfile.TemporaryDirectory(prefix="octo-lutris-") as tmp:
+            result = subprocess.run(
+                [lutris, "--output-script", game_id],
+                cwd=tmp, capture_output=True, text=True,
+                timeout=LUTRIS_TIMEOUT, check=False)
+            if result.returncode != 0:
+                return None
+            entries = list(Path(tmp).iterdir())
+            if (len(entries) != 1 or entries[0].is_symlink()
+                    or not stat.S_ISREG(entries[0].stat().st_mode)):
+                return None
+            if entries[0].stat().st_size > LUTRIS_SCRIPT_MAX_BYTES:
+                return None
+            return lutris_script_executable(
+                entries[0].read_text(encoding="utf-8", errors="replace"))
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def discover_lutris_games(client_dir: str) -> dict:
+    """Discover exact Wine-runner matches through Lutris's supported CLI."""
+    lutris = shutil.which("lutris")
+    if not lutris:
+        return {"status": "missing", "matches": [], "lutris": None}
+    try:
+        result = subprocess.run(
+            [lutris, "--list-games", "--installed", "--json"],
+            capture_output=True, text=True, timeout=LUTRIS_TIMEOUT,
+            check=False)
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout).strip()
+            raise RuntimeError(detail or f"Lutris exited with {result.returncode}")
+        matches = matching_lutris_games(result.stdout, client_dir)
+        for game in matches:
+            game["executable"] = inspect_lutris_executable(lutris, game["id"])
+        return {"status": "ready", "matches": matches, "lutris": lutris}
+    except (OSError, subprocess.SubprocessError, ValueError, RuntimeError) as e:
+        return {
+            "status": "error", "matches": [], "lutris": lutris,
+            "error": str(e),
+        }
 
 
 def ensure_dir(path):
@@ -2976,6 +3115,10 @@ class OctoUpdaterApp(tk.Tk):
         self._logwin = None
         self._logwin_text = None
         self._settings_overlay = None
+        self._lutris_state = {
+            "status": "idle", "path": None, "matches": [], "selected": None,
+        }
+        self._lutris_probe_token = 0
         # Guards against triggering the default-mods / recommended-addons
         # auto-install more than once per app session (e.g. verify firing
         # twice in quick succession).
@@ -5755,6 +5898,14 @@ class OctoUpdaterApp(tk.Tk):
                  font=("Segoe UI", 10), fg=C_TEXT, bg=C_BG).pack(
                  side="bottom", pady=(0, self._px(6)))
 
+        self._launcher_note = tk.Label(
+            pb_frame, text="", font=("Segoe UI", 9),
+            fg=C_TEXT_DIM, bg=C_BG, cursor="arrow", anchor="w")
+        self._launcher_note.place(x=0, y=self._px(8))
+        self._launcher_note.bind(
+            "<Button-1>", lambda e: self._show_posix_launch_help()
+            if self._launcher_note.cget("text") else None)
+
         tk.Label(foot, text=f"v{UPDATER_VERSION}",
                  font=("Courier New", 8),
                  fg="#555560", bg=C_BG).place(relx=1.0, rely=1.0,
@@ -5803,7 +5954,7 @@ class OctoUpdaterApp(tk.Tk):
         # This also re-arms the default-mods / recommended-addons auto-install.
         def _wipe(c):
             c["out_dir"] = new_val
-            for k in ("mods", "addons"):
+            for k in ("mods", "addons", "posix_launcher"):
                 c.pop(k, None)
         self._cfg = update_config(_wipe)
 
@@ -5811,6 +5962,10 @@ class OctoUpdaterApp(tk.Tk):
         self._default_mods_install_started = False
         self._default_addons_install_started = False
         self._client_ready = False
+        self._lutris_probe_token += 1
+        self._lutris_state = {
+            "status": "idle", "path": None, "matches": [], "selected": None,
+        }
 
         # Reset session-level state so nothing from the previous folder is
         # served from memory: addons verify + rendered list, news timers, badges.
@@ -6367,18 +6522,28 @@ class OctoUpdaterApp(tk.Tk):
 
     def _set_btn_play(self):
         self._btn_mode = "play"
-        self._upd_btn.configure(text="PLAY", bg=C_GREEN_BTN, fg="#ffffff")
+        self._upd_btn.configure(
+            text="PLAY", bg=C_GREEN_BTN, fg="#ffffff", width=14)
         self._btn_glow.configure(bg="#2b511d")
 
     def _set_btn_update(self):
         self._btn_mode = "update"
-        self._upd_btn.configure(text="UPDATE", bg=C_GOLD, fg="#ffffff")
+        self._upd_btn.configure(
+            text="UPDATE", bg=C_GOLD, fg="#ffffff", width=14)
         self._btn_glow.configure(bg="#4a3812")
 
     def _set_btn_busy(self, label="…"):
         self._btn_mode = "busy"
-        self._upd_btn.configure(text=label, bg="#2a2434", fg=C_TEXT_DIM)
+        self._upd_btn.configure(
+            text=label, bg="#2a2434", fg=C_TEXT_DIM, width=14)
         self._btn_glow.configure(bg="#211c2c")
+
+    def _set_btn_action(self, mode: str, label: str):
+        self._btn_mode = mode
+        self._upd_btn.configure(
+            text=label, bg=C_GOLD, fg="#ffffff",
+            width=16 if label == "CHOOSE LAUNCHER" else 14)
+        self._btn_glow.configure(bg="#4a3812")
 
     def _btn_hover(self, entering: bool):
         if self._btn_mode == "busy":
@@ -6396,6 +6561,103 @@ class OctoUpdaterApp(tk.Tk):
         return any(bool(s.get("error"))
                    for s in load_config().get("mods", {}).values())
 
+    def _set_launcher_note(self, text: str = "", warning: bool = False):
+        self._launcher_note.configure(
+            text=text, fg=C_GOLD if warning else C_TEXT_DIM,
+            cursor="hand2" if text else "arrow")
+
+    def _start_lutris_probe(self, force: bool = False):
+        client_dir = self._game_path.get().strip()
+        normalized = _normalized_real_path(client_dir)
+        state = self._lutris_state
+        if (not force and state.get("status") in
+                {"probing", "ready", "missing", "error"}
+                and state.get("path") == normalized):
+            return
+        self._lutris_probe_token += 1
+        token = self._lutris_probe_token
+        self._lutris_state = {
+            "status": "probing", "path": normalized,
+            "matches": [], "selected": None,
+        }
+        self._set_btn_busy("CHECKING…")
+        self._status_var.set("Checking Lutris…")
+
+        def worker():
+            result = discover_lutris_games(client_dir)
+            self.after(0, lambda: self._finish_lutris_probe(
+                token, normalized, result))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_lutris_probe(self, token: int, path: str, result: dict):
+        if token != self._lutris_probe_token:
+            return
+        result["path"] = path
+        result["selected"] = None
+        matches = result.get("matches", [])
+        saved = load_config().get("posix_launcher", {})
+        saved_id = str(saved.get("game_id", ""))
+        if len(matches) == 1:
+            result["selected"] = matches[0]
+            if saved_id and saved_id != matches[0]["id"]:
+                self._log_line(
+                    f"Saved Lutris game {saved_id} no longer matches this "
+                    "game folder; selection cleared.\n", "dim")
+                self._cfg = update_config(
+                    lambda c: c.pop("posix_launcher", None))
+        elif saved_id:
+            result["selected"] = next(
+                (game for game in matches if game["id"] == saved_id), None)
+            if result["selected"] is None:
+                self._log_line(
+                    f"Saved Lutris game {saved_id} no longer matches this "
+                    "game folder; selection cleared.\n", "dim")
+                self._cfg = update_config(
+                    lambda c: c.pop("posix_launcher", None))
+        self._lutris_state = result
+        if result.get("status") == "error":
+            self._log_line(
+                "Could not inspect Lutris games: "
+                f"{result.get('error', 'unknown error')}\n", "err")
+        self._refresh_ready_state()
+
+    def _refresh_lutris_ready_state(self):
+        state = self._lutris_state
+        current_path = _normalized_real_path(self._game_path.get().strip())
+        if state.get("path") != current_path or state.get("status") == "idle":
+            self._start_lutris_probe()
+            return
+        if state.get("status") == "probing":
+            self._set_btn_busy("CHECKING…")
+            self._status_var.set("Checking Lutris…")
+            return
+
+        selected = state.get("selected")
+        if selected:
+            self._set_btn_play()
+            self._status_var.set("Everything up to date!")
+            _, expected = selected_game_executable(
+                self._game_path.get().strip(), load_config())
+            note, warning = lutris_launcher_note(
+                expected, selected.get("executable"))
+            self._set_launcher_note(note, warning)
+            return
+
+        matches = state.get("matches", [])
+        if len(matches) > 1:
+            self._set_btn_action("choose_launcher", "CHOOSE LAUNCHER")
+            self._status_var.set("Multiple Lutris entries")
+        elif state.get("status") == "missing":
+            self._set_btn_action("launch_help", "HOW TO PLAY")
+            self._status_var.set("Lutris not found")
+        elif state.get("status") == "error":
+            self._set_btn_action("launch_help", "HOW TO PLAY")
+            self._status_var.set("Lutris check failed")
+        else:
+            self._set_btn_action("launch_help", "HOW TO PLAY")
+            self._status_var.set("Add game folder to Lutris")
+
     def _refresh_ready_state(self):
         """Recompute the footer status/button after an operation finishes.
         PLAY is only offered when the client files are up to date AND no mod
@@ -6403,6 +6665,7 @@ class OctoUpdaterApp(tk.Tk):
         # Never re-enable PLAY while addons are actively installing — this
         # guards against a stray call during the mods→addons setup chain or a
         # post-install verify flipping the button back on mid-download.
+        self._set_launcher_note()
         if self._addons_installing:
             self._set_btn_busy("Installing…")
             self._status_var.set("Downloading addons…")
@@ -6415,37 +6678,119 @@ class OctoUpdaterApp(tk.Tk):
             self._set_btn_busy("PLAY")
             self._status_var.set("Mod errors — check MODS tab")
         else:
-            self._set_btn_play()
-            self._status_var.set("Everything up to date!")
+            if sys.platform == "win32":
+                self._set_btn_play()
+                self._status_var.set("Everything up to date!")
+            elif sys.platform.startswith("linux"):
+                self._refresh_lutris_ready_state()
+            else:
+                self._set_btn_action("launch_help", "HOW TO PLAY")
+                self._status_var.set("Launch the Windows client separately")
 
     def _btn_click(self):
         if self._btn_mode == "play":
             self._launch_game()
         elif self._btn_mode == "update":
             self._start_update()
+        elif self._btn_mode == "choose_launcher":
+            self._choose_lutris_game()
+        elif self._btn_mode == "launch_help":
+            self._show_posix_launch_help()
+
+    def _choose_lutris_game(self):
+        matches = self._lutris_state.get("matches", [])
+        if len(matches) < 2:
+            self._refresh_ready_state()
+            return
+        win = tk.Toplevel(self)
+        win.title("Choose Lutris game")
+        win.configure(bg=C_PANEL)
+        win.resizable(False, False)
+        win.transient(self)
+        choice = tk.StringVar(value=matches[0]["id"])
+        tk.Label(
+            win, text="Multiple Lutris entries use this game folder.\n"
+            "Choose the entry PLAY should launch:",
+            font=("Segoe UI", 10), fg=C_TEXT, bg=C_PANEL,
+            justify="left").pack(anchor="w", padx=self._px(18),
+                                 pady=(self._px(16), self._px(8)))
+        for game in matches:
+            tk.Radiobutton(
+                win, text=f'{game["name"]} (ID {game["id"]})',
+                variable=choice, value=game["id"], font=("Segoe UI", 10),
+                fg=C_TEXT, bg=C_PANEL, activebackground=C_PANEL,
+                activeforeground=C_TEXT, selectcolor=C_LOG_BG,
+                highlightthickness=0).pack(
+                    anchor="w", padx=self._px(18), pady=self._px(3))
+
+        def save():
+            selected = next(
+                game for game in matches if game["id"] == choice.get())
+            self._cfg = update_config(lambda c: c.__setitem__(
+                "posix_launcher", {
+                    "game_id": selected["id"], "label": selected["name"],
+                }))
+            self._lutris_state["selected"] = selected
+            win.destroy()
+            self._refresh_ready_state()
+
+        tk.Button(
+            win, text="Use selected entry", command=save,
+            font=("Segoe UI", 10, "bold"), fg="#ffffff", bg=C_GOLD,
+            activebackground=C_GOLD_LT, relief="flat",
+            padx=self._px(12), pady=self._px(5)).pack(
+                anchor="e", padx=self._px(18), pady=self._px(16))
+        win.grab_set()
+
+    def _show_posix_launch_help(self):
+        from tkinter import messagebox
+        client_dir = self._game_path.get().strip()
+        _, exe_lbl = selected_game_executable(client_dir, load_config())
+        if not sys.platform.startswith("linux"):
+            messagebox.showinfo(
+                "Launching the game",
+                "Native game launching is currently supported only on Linux "
+                "through an existing Lutris entry.\n\n"
+                f"Launch {exe_lbl} separately through the Wine-compatible "
+                "launcher configured for this game.",
+                parent=self)
+            return
+        retry = messagebox.askretrycancel(
+            "Launching the game",
+            "Octo Updater can use an existing Lutris game entry whose "
+            "directory exactly matches this game folder:\n\n"
+            f"{client_dir}\n\n"
+            "In Lutris, add a locally installed Windows game, set its game "
+            f"directory to the folder above, and set its executable to "
+            f"{exe_lbl}. VanillaFixes.exe is required to load installed mod "
+            "DLLs when it is available.\n\n"
+            "You can also keep launching the game manually through Steam, "
+            "Proton, Bottles, Wine, or another launcher.\n\n"
+            "Retry Lutris detection now?",
+            parent=self)
+        if retry and sys.platform.startswith("linux"):
+            self._start_lutris_probe(force=True)
 
     def _launch_game(self):
-        """Launch the game detached.
+        """Launch through the native Windows path or a matched Lutris entry.
         If VanillaFixes is installed use VanillaFixes.exe (it injects dlls then
         starts WoW.exe itself). Otherwise fall back to WoW.exe directly."""
         import subprocess
         client_dir = self._game_path.get().strip()
         cfg        = load_config()
-        vf_state   = cfg.get("mods", {}).get("VanillaFixes", {})
-        vf_installed = (vf_state.get("enabled") and
-                        vf_state.get("installed_version") and
-                        os.path.exists(os.path.join(client_dir, "VanillaFixes.exe")))
-
-        if vf_installed:
-            exe     = os.path.join(client_dir, "VanillaFixes.exe")
-            exe_lbl = "VanillaFixes.exe"
-        else:
-            exe     = os.path.join(client_dir, "WoW.exe")
-            exe_lbl = "WoW.exe"
+        exe, exe_lbl = selected_game_executable(client_dir, cfg)
 
         if not os.path.exists(exe):
             self._log_line(f"{exe_lbl} not found at: {exe}\n", "err")
             return
+
+        lutris_game = None
+        if sys.platform.startswith("linux"):
+            lutris_game = self._lutris_state.get("selected")
+            lutris = self._lutris_state.get("lutris")
+            if not lutris_game or not lutris:
+                self._refresh_ready_state()
+                return
 
         # One-time DXVK first-launch notice (armed when DXVK was installed).
         if cfg.get("dxvk_notice_pending"):
@@ -6465,17 +6810,26 @@ class OctoUpdaterApp(tk.Tk):
             remove_wdb(client_dir)
 
         try:
-            flags = (getattr(subprocess, "DETACHED_PROCESS", 0)
-                     | getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0))
-            try:
-                subprocess.Popen([exe], cwd=client_dir,
-                                 creationflags=flags, close_fds=True)
-            except OSError:
-                # The job object doesn't permit breakaway — retry without it.
-                flags &= ~getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0)
-                subprocess.Popen([exe], cwd=client_dir,
-                                 creationflags=flags, close_fds=True)
-            self._log_line(f"Launched {exe_lbl}!\n", "ok")
+            if sys.platform == "win32":
+                flags = (getattr(subprocess, "DETACHED_PROCESS", 0)
+                         | getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0))
+                try:
+                    subprocess.Popen([exe], cwd=client_dir,
+                                     creationflags=flags, close_fds=True)
+                except OSError:
+                    # The job object doesn't permit breakaway — retry without it.
+                    flags &= ~getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0)
+                    subprocess.Popen([exe], cwd=client_dir,
+                                     creationflags=flags, close_fds=True)
+                self._log_line(f"Launched {exe_lbl}!\n", "ok")
+            else:
+                subprocess.Popen(
+                    lutris_launch_command(
+                        self._lutris_state["lutris"], lutris_game["id"]),
+                    cwd=client_dir, close_fds=True)
+                self._log_line(
+                    f'Launching via Lutris ({lutris_game["name"]}); '
+                    f"expected executable: {exe_lbl}.\n", "ok")
             # Briefly disable PLAY so a double-click can't spawn two clients.
             self._set_btn_busy("PLAY")
             self._status_var.set("Launching...")
@@ -6484,7 +6838,13 @@ class OctoUpdaterApp(tk.Tk):
                 self.after(1000, self.iconify) # self._on_close and return
             self.after(5000, self._refresh_ready_state)
         except Exception as e:
-            self._log_line(f"Failed to launch {exe_lbl}: {e}\n", "err")
+            if sys.platform == "win32":
+                self._log_line(f"Failed to launch {exe_lbl}: {e}\n", "err")
+            else:
+                self._log_line(
+                    f"Failed to launch {exe_lbl} via Lutris: {e}\n", "err")
+                self._status_var.set("Launch failed — check the log")
+                self.after(1500, self._refresh_ready_state)
 
     # ── verify lifecycle ──────────────────────────────────────────────────────────
 
