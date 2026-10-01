@@ -38,6 +38,15 @@ class SelectedExecutableTests(unittest.TestCase):
 
 
 class LutrisMatchingTests(unittest.TestCase):
+    def test_launch_command_is_fixed_argv_and_requires_numeric_id(self):
+        self.assertEqual(
+            octo_updater.lutris_launch_command("/usr/bin/lutris", "42"),
+            ["/usr/bin/lutris", "lutris:rungameid/42"],
+        )
+        with self.assertRaisesRegex(ValueError, "numeric"):
+            octo_updater.lutris_launch_command(
+                "/usr/bin/lutris", "42;touch /tmp/no")
+
     def test_matches_only_exact_directory_wine_entries_with_numeric_ids(self):
         with tempfile.TemporaryDirectory() as client_dir:
             games = [
@@ -85,130 +94,6 @@ class LutrisMatchingTests(unittest.TestCase):
             octo_updater.matching_lutris_games("{}", "/tmp/game")
 
 
-class LutrisScriptTests(unittest.TestCase):
-    def test_launch_command_is_fixed_argv_and_requires_numeric_id(self):
-        self.assertEqual(
-            octo_updater.lutris_launch_command("/usr/bin/lutris", "42"),
-            ["/usr/bin/lutris", "lutris:rungameid/42"],
-        )
-        with self.assertRaisesRegex(ValueError, "numeric"):
-            octo_updater.lutris_launch_command(
-                "/usr/bin/lutris", "42;touch /tmp/no")
-
-    def test_detects_vanilla_fixes_from_quoted_command(self):
-        script = """#!/bin/bash
-# Command
-'/games/Octo WoW/VanillaFixes.exe' --arg
-"""
-        self.assertEqual(
-            octo_updater.lutris_script_executable(script), "vanillafixes")
-
-    def test_detects_wow_with_windows_separators(self):
-        script = """#!/bin/bash
-# Command
-wine 'Z:\\\\games\\\\OctoWoW\\\\WoW.exe'
-"""
-        self.assertEqual(octo_updater.lutris_script_executable(script), "wow")
-
-    def test_returns_unknown_for_ambiguous_or_malformed_script(self):
-        ambiguous = "# Command\nwine WoW.exe VanillaFixes.exe\n"
-        malformed = "# Command\n'unterminated\n"
-        self.assertIsNone(octo_updater.lutris_script_executable(ambiguous))
-        self.assertIsNone(octo_updater.lutris_script_executable(malformed))
-        self.assertIsNone(octo_updater.lutris_script_executable("#!/bin/bash"))
-
-    def test_extracts_only_absolute_executable_parent_for_matching(self):
-        absolute = (
-            "# Command\n"
-            "wine '/games/Octo WoW/VanillaFixes.exe' --arg\n"
-        )
-        inspection = octo_updater.lutris_script_inspection(absolute)
-        self.assertEqual(inspection["classification"], "vanillafixes")
-        self.assertEqual(inspection["executable_parent"], "/games/Octo WoW")
-
-        relative = octo_updater.lutris_script_inspection(
-            "# Command\nwine VanillaFixes.exe\n")
-        self.assertEqual(relative["classification"], "vanillafixes")
-        self.assertIsNone(relative["executable_parent"])
-        self.assertIn("relative", relative["reason"])
-
-    def test_warning_only_for_verified_wow_when_vanilla_fixes_expected(self):
-        warning, is_warning = octo_updater.lutris_launcher_note(
-            "VanillaFixes.exe", "wow")
-        self.assertIn("Lutris launches WoW.exe", warning)
-        self.assertTrue(is_warning)
-
-        self.assertEqual(
-            octo_updater.lutris_launcher_note(
-                "VanillaFixes.exe", "vanillafixes"),
-            ("", False),
-        )
-        neutral, is_warning = octo_updater.lutris_launcher_note(
-            "VanillaFixes.exe", None)
-        self.assertIn("not verified", neutral)
-        self.assertFalse(is_warning)
-        self.assertEqual(
-            octo_updater.lutris_launcher_note("WoW.exe", "wow"),
-            ("", False),
-        )
-
-    def test_inspection_reads_generated_script_without_executing_it(self):
-        def write_script(args, **kwargs):
-            Path(kwargs["cwd"], "octowow.sh").write_text(
-                "#!/bin/bash\n# Command\nwine VanillaFixes.exe\n",
-                encoding="utf-8",
-            )
-            return subprocess.CompletedProcess(args, 0, "", "")
-
-        with mock.patch.object(
-                octo_updater.subprocess, "run", side_effect=write_script) as run:
-            result = octo_updater.inspect_lutris_executable(
-                "/usr/bin/lutris", "42")
-
-        self.assertEqual(result, "vanillafixes")
-        run.assert_called_once()
-        self.assertEqual(
-            run.call_args.args[0],
-            ["/usr/bin/lutris", "--output-script", "42"],
-        )
-        self.assertNotIn("shell", run.call_args.kwargs)
-
-    def test_inspection_rejects_non_numeric_id_and_multiple_files(self):
-        self.assertIsNone(
-            octo_updater.inspect_lutris_executable("/usr/bin/lutris", "x"))
-
-        def write_files(args, **kwargs):
-            Path(kwargs["cwd"], "one.sh").touch()
-            Path(kwargs["cwd"], "two.sh").touch()
-            return subprocess.CompletedProcess(args, 0, "", "")
-
-        with mock.patch.object(
-                octo_updater.subprocess, "run", side_effect=write_files):
-            self.assertIsNone(
-                octo_updater.inspect_lutris_executable(
-                    "/usr/bin/lutris", "42"))
-
-    def test_inspection_rejects_oversized_script(self):
-        def write_oversized(args, **kwargs):
-            Path(kwargs["cwd"], "large.sh").write_bytes(
-                b"x" * (octo_updater.LUTRIS_SCRIPT_MAX_BYTES + 1))
-            return subprocess.CompletedProcess(args, 0, "", "")
-
-        with mock.patch.object(
-                octo_updater.subprocess, "run", side_effect=write_oversized):
-            self.assertIsNone(
-                octo_updater.inspect_lutris_executable(
-                    "/usr/bin/lutris", "42"))
-
-    def test_inspection_timeout_is_inconclusive_not_an_error(self):
-        with mock.patch.object(
-                octo_updater.subprocess, "run",
-                side_effect=subprocess.TimeoutExpired(["lutris"], 10)):
-            self.assertIsNone(
-                octo_updater.inspect_lutris_executable(
-                    "/usr/bin/lutris", "42"))
-
-
 class LutrisDiscoveryTests(unittest.TestCase):
     @staticmethod
     def _messages(log_mock):
@@ -227,7 +112,7 @@ class LutrisDiscoveryTests(unittest.TestCase):
         self.assertIn("'lutris' was not found", messages)
         self.assertIn("missing tool, 0 exact matches", messages)
 
-    def test_discovers_and_inspects_exact_matches(self):
+    def test_discovers_exact_match_without_output_script_probe(self):
         with tempfile.TemporaryDirectory() as client_dir:
             payload = json.dumps([{
                 "id": 42,
@@ -242,28 +127,26 @@ class LutrisDiscoveryTests(unittest.TestCase):
                     return_value="/usr/bin/lutris"), \
                     mock.patch.object(
                         octo_updater.subprocess, "run",
-                        return_value=completed) as run, \
-                    mock.patch.object(
-                        octo_updater, "inspect_lutris_game",
-                        return_value={
-                            "classification": "wow",
-                            "executable_path": os.path.join(
-                                client_dir, "WoW.exe"),
-                            "executable_parent": client_dir,
-                            "reason": None,
-                        }) as inspect:
+                        return_value=completed) as run:
                 result = octo_updater.discover_lutris_games(client_dir)
 
         self.assertEqual(result["status"], "ready")
-        self.assertEqual(result["matches"][0]["executable"], "wow")
         self.assertEqual(
-            result["matches"][0]["match_source"], "json-directory")
-        inspect.assert_called_once_with("/usr/bin/lutris", "42")
+            result["matches"],
+            [{
+                "id": "42",
+                "name": "OctoWoW",
+                "runner": "wine",
+                "directory": client_dir,
+            }],
+        )
+        run.assert_called_once()
         self.assertEqual(
             run.call_args.args[0],
             ["/usr/bin/lutris", "--list-games", "--installed", "--json"],
         )
         self.assertNotIn("shell", run.call_args.kwargs)
+        self.assertNotIn("--output-script", run.call_args.args[0])
 
     def test_reports_timeout_and_malformed_json_as_probe_errors(self):
         with mock.patch.object(
@@ -329,14 +212,14 @@ class LutrisDiscoveryTests(unittest.TestCase):
         self.assertIn("Installed entries returned: 3", messages)
         self.assertIn("runner is not literal 'wine'", messages)
         self.assertIn("name='Wrong runner'", messages)
-        self.assertIn("JSON directory mismatch", messages)
+        self.assertIn("normalized directory mismatch", messages)
         self.assertIn("target='/games/OctoWoW'", messages)
         self.assertIn("candidate='/games/AnotherWoW'", messages)
         self.assertIn("ID is not numeric", messages)
-        self.assertIn("Exact normalized JSON directory matches: 0", messages)
+        self.assertIn("Exact normalized directory matches: 0", messages)
         self.assertIn("ready, 0 exact matches", messages)
 
-    def test_accepts_prefix_root_entry_via_exact_executable_parent(self):
+    def test_rejects_prefix_root_without_output_script_probe(self):
         client_dir = "/games/wrath/drive_c/world_of_warcraft"
         payload = json.dumps([{
             "id": 4,
@@ -345,105 +228,22 @@ class LutrisDiscoveryTests(unittest.TestCase):
             "directory": "/games/wrath",
         }])
         completed = subprocess.CompletedProcess(["lutris"], 0, payload, "")
-        inspection = {
-            "classification": "vanillafixes",
-            "executable_path": client_dir + "/VanillaFixes.exe",
-            "executable_parent": client_dir,
-            "reason": None,
-        }
         with mock.patch.object(
                 octo_updater.shutil, "which",
                 return_value="/usr/bin/lutris"), \
                 mock.patch.object(
-                    octo_updater.subprocess, "run", return_value=completed), \
-                mock.patch.object(
-                    octo_updater, "inspect_lutris_game",
-                    return_value=inspection) as inspect, \
-                mock.patch.object(octo_updater, "log") as logger:
-            result = octo_updater.discover_lutris_games(client_dir)
-
-        self.assertEqual(len(result["matches"]), 1)
-        self.assertEqual(result["matches"][0]["id"], "4")
-        self.assertEqual(
-            result["matches"][0]["match_source"],
-            "output-script-executable",
-        )
-        self.assertEqual(
-            result["matches"][0]["executable"], "vanillafixes")
-        inspect.assert_called_once_with("/usr/bin/lutris", "4")
-        messages = self._messages(logger)
-        self.assertIn("trying output-script executable fallback", messages)
-        self.assertIn(
-            "accepted via output-script executable parent",
-            messages,
-        )
-
-    def test_rejects_executable_elsewhere_under_same_prefix(self):
-        client_dir = "/games/wrath/drive_c/world_of_warcraft"
-        payload = json.dumps([{
-            "id": 4,
-            "name": "Wrath",
-            "runner": "wine",
-            "directory": "/games/wrath",
-        }])
-        completed = subprocess.CompletedProcess(["lutris"], 0, payload, "")
-        inspection = {
-            "classification": "wow",
-            "executable_path": "/games/wrath/drive_c/other/WoW.exe",
-            "executable_parent": "/games/wrath/drive_c/other",
-            "reason": None,
-        }
-        with mock.patch.object(
-                octo_updater.shutil, "which",
-                return_value="/usr/bin/lutris"), \
-                mock.patch.object(
-                    octo_updater.subprocess, "run", return_value=completed), \
-                mock.patch.object(
-                    octo_updater, "inspect_lutris_game",
-                    return_value=inspection), \
+                    octo_updater.subprocess, "run",
+                    return_value=completed) as run, \
                 mock.patch.object(octo_updater, "log") as logger:
             result = octo_updater.discover_lutris_games(client_dir)
 
         self.assertEqual(result["matches"], [])
+        run.assert_called_once()
+        self.assertNotIn("--output-script", run.call_args.args[0])
         messages = self._messages(logger)
-        self.assertIn("executable parent mismatch", messages)
-        self.assertIn(
-            "target='/games/wrath/drive_c/world_of_warcraft'",
-            messages,
-        )
-        self.assertIn("parent='/games/wrath/drive_c/other'", messages)
-
-    def test_rejects_inconclusive_fallback_without_ancestor_guessing(self):
-        client_dir = "/games/wrath/drive_c/world_of_warcraft"
-        payload = json.dumps([{
-            "id": 4,
-            "name": "Wrath",
-            "runner": "wine",
-            "directory": "/games/wrath",
-        }])
-        completed = subprocess.CompletedProcess(["lutris"], 0, payload, "")
-        inspection = {
-            "classification": None,
-            "executable_path": None,
-            "executable_parent": None,
-            "reason": "multiple supported game executables in command",
-        }
-        with mock.patch.object(
-                octo_updater.shutil, "which",
-                return_value="/usr/bin/lutris"), \
-                mock.patch.object(
-                    octo_updater.subprocess, "run", return_value=completed), \
-                mock.patch.object(
-                    octo_updater, "inspect_lutris_game",
-                    return_value=inspection), \
-                mock.patch.object(octo_updater, "log") as logger:
-            result = octo_updater.discover_lutris_games(client_dir)
-
-        self.assertEqual(result["matches"], [])
-        self.assertIn(
-            "multiple supported game executables in command",
-            self._messages(logger),
-        )
+        self.assertIn("normalized directory mismatch", messages)
+        self.assertIn(f"target={client_dir!r}", messages)
+        self.assertIn("candidate='/games/wrath'", messages)
 
     def test_logs_unexpected_json_shape(self):
         completed = subprocess.CompletedProcess(["lutris"], 0, "{}", "")
@@ -463,6 +263,44 @@ class LutrisDiscoveryTests(unittest.TestCase):
 
 
 class LutrisProbeLifecycleTests(unittest.TestCase):
+    @staticmethod
+    def _ready_app(matches):
+        app = object.__new__(octo_updater.OctoUpdaterApp)
+        app._game_path = mock.Mock()
+        app._game_path.get.return_value = "/games/OctoWoW"
+        app._lutris_state = {
+            "status": "ready",
+            "path": "/games/OctoWoW",
+            "matches": matches,
+            "selected": None,
+        }
+        app._set_btn_action = mock.Mock()
+        app._status_var = mock.Mock()
+        return app
+
+    def test_no_exact_match_selects_actionable_how_to_play_state(self):
+        app = self._ready_app([])
+
+        app._refresh_lutris_ready_state()
+
+        app._set_btn_action.assert_called_once_with(
+            "launch_help", "HOW TO PLAY")
+        app._status_var.set.assert_called_once_with(
+            "Add game folder to Lutris")
+
+    def test_multiple_exact_matches_select_chooser_state(self):
+        app = self._ready_app([
+            {"id": "4", "name": "Wrath"},
+            {"id": "5", "name": "Wrath alternate"},
+        ])
+
+        app._refresh_lutris_ready_state()
+
+        app._set_btn_action.assert_called_once_with(
+            "choose_launcher", "CHOOSE LAUNCHER")
+        app._status_var.set.assert_called_once_with(
+            "Multiple Lutris entries")
+
     def test_retry_logs_cache_invalidation_and_starts_fresh_probe(self):
         app = object.__new__(octo_updater.OctoUpdaterApp)
         app._game_path = mock.Mock()
