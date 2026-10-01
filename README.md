@@ -117,6 +117,10 @@ verification/updates.
   run. Native Linux/macOS runs use the system-installed executable.
 - Atomic config writes (temp + rename) with a lock — safe against concurrent
   workers and interrupted saves.
+- Closing Octo Updater during a game-file update waits while protected mod
+  files are restored. A small transaction journal repairs the same files on
+  the next launch after a crash or power loss; unrelated legacy `.octobak`
+  files are never restored or deleted automatically.
 - Path-traversal-safe archive extraction.
 - DPI-aware layout — the UI scales as a unit on high-DPI displays instead of
   fonts overflowing a fixed-pixel layout.
