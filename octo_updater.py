@@ -61,7 +61,7 @@ def _default_app_data_dir() -> str:
     # --- POSIX (Linux / macOS) path using XDG standard ---
     else:
         xdg_config = os.environ.get("XDG_CONFIG_HOME")
-        if not xdg_config:
+        if not xdg_config or not os.path.isabs(xdg_config):
             xdg_config = os.path.join(os.path.expanduser("~"), ".config")
         path = os.path.join(xdg_config, "octo-updater")
         try:
