@@ -333,7 +333,14 @@ CLIENT_TORRENT_URL = "https://dl.octowow.st/download/client.torrent"
 ARIA2_ZIP_URL    = ("https://github.com/aria2/aria2/releases/download/"
                     "release-1.37.0/aria2-1.37.0-win-32bit-build1.zip")
 ARIA2_ZIP_SHA256 = "35f6514cc5dd7e98a87b3c4c2d25a0754b9b063dbe59bc0f22d483464f61e5b6"
-ARIA2C_PATH      = os.path.join(APP_DATA_DIR, "aria2c.exe")
+
+if sys.platform == "win32":
+    ARIA2C_PATH  = os.path.join(APP_DATA_DIR, "aria2c.exe")
+else:
+    # On POSIX, resolve the system-installed binary
+    ARIA2C_PATH = shutil.which("aria2c")
+    if not ARIA2C_PATH and os.path.exists("/home/linuxbrew/.linuxbrew/bin/aria2c"):
+        ARIA2C_PATH = "/home/linuxbrew/.linuxbrew/bin/aria2c"
 
 # The torrent's top-level folder name: aria2 writes files under <dir>/<name>/…,
 # so a junction <staging>/client → the real client dir lands them in place.
@@ -392,7 +399,17 @@ _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 def ensure_aria2c(log_fn=log) -> str:
     """Return the path to aria2c.exe, downloading + checksum-verifying it into
-    APP_DATA_DIR on first use. Raises on failure."""
+    APP_DATA_DIR on Windows. On POSIX, relies on the system-installed aria2c."""
+    import sys
+
+    # --- Linux / macOS path ---
+    if sys.platform != "win32":
+        if not ARIA2C_PATH:
+            raise RuntimeError("aria2c not found in PATH. Please install it natively (e.g., 'brew install aria2').")
+        log_fn("aria2c ready.", "ok")
+        return ARIA2C_PATH
+
+    # --- Windows path ---
     if os.path.exists(ARIA2C_PATH):
         return ARIA2C_PATH
     log_fn("Fetching aria2c (one-time, ~2.5 MB)…", "acct")
@@ -889,6 +906,7 @@ def run_aria2c(client_dir, select_files=None, check_integrity=False,
     aria2 is handed the .torrent URL (not a local copy), so it always fetches
     the server's current torrent at download time — no chance of running a stale
     local .torrent if the user starts the update long after the verify."""
+    import sys
     global _active_aria2
     exe     = ensure_aria2c(log_fn)
     staging = _ensure_torrent_junction(client_dir)
@@ -925,9 +943,16 @@ def run_aria2c(client_dir, select_files=None, check_integrity=False,
         args.append("--select-file=" + ",".join(str(i) for i in select_files))
     args.append(CLIENT_TORRENT_URL)
 
-    proc = subprocess.Popen(args, stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT, text=True,
-                            bufsize=1, creationflags=_NO_WINDOW)
+    popen_kwargs = {
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.STDOUT,
+        "text": True,
+        "bufsize": 1
+    }
+    if sys.platform == "win32":
+        popen_kwargs["creationflags"] = _NO_WINDOW
+
+    proc = subprocess.Popen(args, **popen_kwargs)
     with _active_aria2_lock:
         _active_aria2 = proc
     try:
