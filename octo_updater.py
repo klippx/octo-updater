@@ -66,6 +66,13 @@ def _default_app_data_dir() -> str:
         path = os.path.join(xdg_config, "octo-updater")
         try:
             os.makedirs(path, exist_ok=True)
+            old_config = os.path.join(APP_DIR, "config.json")
+            new_config = os.path.join(path, "config.json")
+            if os.path.exists(old_config) and not os.path.exists(new_config):
+                try:
+                    shutil.move(old_config, new_config)
+                except OSError:
+                    return APP_DIR
             return path
         except OSError:
             pass
