@@ -404,17 +404,11 @@ def lutris_launch_command(lutris: str, game_id: str) -> list[str]:
 def discover_lutris_games(client_dir: str) -> dict:
     """Discover Wine-runner directory matches through Lutris's supported CLI."""
     normalized = _normalized_real_path(client_dir)
-    log(f"\n[Lutris] Discovery started; normalized game directory: "
-        f"{_bounded_log_detail(normalized)}", "acct")
     lutris = shutil.which("lutris")
     if not lutris:
-        log("[Lutris] PATH lookup: 'lutris' was not found.", "err")
-        log("[Lutris] Discovery finished: missing tool, 0 matches.",
-            "dim")
+        log("[Lutris] Lutris was not found in PATH.", "err")
         return {"status": "missing", "matches": [], "lutris": None}
-    log(f"[Lutris] PATH lookup resolved executable: {lutris}", "dim")
     argv = [lutris, "--list-games", "--installed", "--json"]
-    log(f"[Lutris] Running (no shell): {argv!r}", "dim")
     try:
         result = subprocess.run(
             argv,
@@ -428,16 +422,22 @@ def discover_lutris_games(client_dir: str) -> dict:
             log(f"[Lutris] Discovery command failed with exit code "
                 f"{result.returncode}{f': {detail}' if detail else '.'}", "err")
             raise RuntimeError(message)
-        diagnostics = []
         matches = matching_lutris_games(
-            result.stdout, client_dir, diagnostics=diagnostics)
-        games = json.loads(result.stdout)
-        log(f"[Lutris] Installed entries returned: {len(games)}.", "dim")
-        for detail in diagnostics:
-            log(f"[Lutris] Candidate {_bounded_log_detail(detail)}", "dim")
-        log(f"[Lutris] Accepted directory matches: {len(matches)}.", "dim")
-        log(f"[Lutris] Discovery finished: ready, {len(matches)} "
-            f"match{'es' if len(matches) != 1 else ''}.", "dim")
+            result.stdout, client_dir)
+        if len(matches) == 1:
+            game = matches[0]
+            match_kind = (
+                "exact directory"
+                if _normalized_real_path(game["directory"]) == normalized
+                else "Wine prefix"
+            )
+            log(f'[Lutris] Matched "{game["name"]}" (ID {game["id"]}) '
+                f"via {match_kind}.", "ok")
+        elif len(matches) > 1:
+            log(f"[Lutris] Found {len(matches)} matching entries; "
+                "choose which one PLAY should use.", "acct")
+        else:
+            log(f"[Lutris] No matching Wine entry for {normalized}.", "dim")
         return {"status": "ready", "matches": matches, "lutris": lutris}
     except subprocess.TimeoutExpired:
         error = f"Lutris discovery timed out after {LUTRIS_TIMEOUT}s"
@@ -452,7 +452,6 @@ def discover_lutris_games(client_dir: str) -> dict:
             f"{_bounded_log_detail(error)}", "err")
     except (subprocess.SubprocessError, RuntimeError) as e:
         error = str(e)
-    log("[Lutris] Discovery finished: probe error, 0 matches.", "dim")
     return {
             "status": "error", "matches": [], "lutris": lutris,
             "error": error,
@@ -6621,10 +6620,6 @@ class OctoUpdaterApp(tk.Tk):
                 {"probing", "ready", "missing", "error"}
                 and state.get("path") == normalized):
             return
-        if force:
-            self._log_line(
-                "\n[Lutris] Retry requested; invalidating cached discovery "
-                "state and starting a fresh probe.\n", "acct")
         self._lutris_probe_token += 1
         token = self._lutris_probe_token
         self._lutris_state = {
@@ -6649,62 +6644,18 @@ class OctoUpdaterApp(tk.Tk):
         matches = result.get("matches", [])
         saved = load_config().get("posix_launcher", {})
         saved_id = str(saved.get("game_id", ""))
-        if saved_id:
-            log(f"[Lutris] Persisted selected game ID found: {saved_id}.",
-                "dim")
         if len(matches) == 1:
             result["selected"] = matches[0]
             if saved_id and saved_id != matches[0]["id"]:
-                log(
-                    f"[Lutris] Persisted game ID {saved_id} is stale for this "
-                    "folder; selection cleared.", "dim")
                 self._cfg = update_config(
                     lambda c: c.pop("posix_launcher", None))
-            elif saved_id:
-                log(
-                    f"[Lutris] Persisted game ID {saved_id} still matches.",
-                    "dim")
         elif saved_id:
             result["selected"] = next(
                 (game for game in matches if game["id"] == saved_id), None)
             if result["selected"] is None:
-                log(
-                    f"[Lutris] Persisted game ID {saved_id} is stale for this "
-                    "folder; selection cleared.", "dim")
                 self._cfg = update_config(
                     lambda c: c.pop("posix_launcher", None))
-            else:
-                log(
-                    f"[Lutris] Persisted game ID {saved_id} still matches.",
-                    "dim")
         self._lutris_state = result
-        if result.get("status") == "error":
-            log(
-                "[Lutris] Could not list Lutris games: "
-                f"{result.get('error', 'unknown error')}", "err")
-        selected = result.get("selected")
-        if selected:
-            reason = ("single directory match" if len(matches) == 1
-                      else f"persisted game ID {selected['id']}")
-            log(f"[Lutris] Final UI state: PLAY ({reason}).", "ok")
-        elif len(matches) > 1:
-            log(
-                f"[Lutris] Final UI state: CHOOSE LAUNCHER "
-                f"({len(matches)} directory matches, no valid saved selection).",
-                "acct")
-        elif result.get("status") == "missing":
-            log(
-                "[Lutris] Final UI state: HOW TO PLAY "
-                "(Lutris executable not found in PATH).", "acct")
-        elif result.get("status") == "error":
-            log(
-                "[Lutris] Final UI state: HOW TO PLAY "
-                "(Lutris discovery failed).", "acct")
-        else:
-            log(
-                f"[Lutris] Final UI state: HOW TO PLAY "
-                f"(no Wine-runner directory match for "
-                f"{_bounded_log_detail(path)}).", "acct")
         self._refresh_ready_state()
 
     def _refresh_lutris_ready_state(self):
@@ -6812,8 +6763,6 @@ class OctoUpdaterApp(tk.Tk):
                 "posix_launcher", {
                     "game_id": selected["id"], "label": selected["name"],
                 }))
-            log(f"[Lutris] Persisted selected game ID {selected['id']} "
-                f"({selected['name']!r}).", "dim")
             self._lutris_state["selected"] = selected
             win.destroy()
             self._refresh_ready_state()
@@ -6929,15 +6878,11 @@ class OctoUpdaterApp(tk.Tk):
                 launch_argv = lutris_launch_command(
                     self._lutris_state["lutris"], lutris_game["id"])
                 self._log_line(
-                    f"[Lutris] Launching selected game ID "
-                    f"{lutris_game['id']} with argv (no shell): "
-                    f"{launch_argv!r}\n", "acct")
+                    f'[Lutris] Launching "{lutris_game["name"]}" '
+                    f'(ID {lutris_game["id"]}).\n', "acct")
                 subprocess.Popen(
                     launch_argv,
                     cwd=client_dir, close_fds=True)
-                self._log_line(
-                    f'Launching via Lutris ({lutris_game["name"]}); '
-                    f"expected executable: {exe_lbl}.\n", "ok")
             # Briefly disable PLAY so a double-click can't spawn two clients.
             self._set_btn_busy("PLAY")
             self._status_var.set("Launching...")

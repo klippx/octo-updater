@@ -177,9 +177,7 @@ class LutrisDiscoveryTests(unittest.TestCase):
         self.assertEqual(result["status"], "missing")
         self.assertEqual(result["matches"], [])
         messages = self._messages(logger)
-        self.assertIn("normalized game directory: /games/OctoWoW", messages)
-        self.assertIn("'lutris' was not found", messages)
-        self.assertIn("missing tool, 0 matches", messages)
+        self.assertEqual(messages, "[Lutris] Lutris was not found in PATH.")
 
     def test_discovers_exact_match_without_output_script_probe(self):
         with tempfile.TemporaryDirectory() as client_dir:
@@ -196,7 +194,8 @@ class LutrisDiscoveryTests(unittest.TestCase):
                     return_value="/usr/bin/lutris"), \
                     mock.patch.object(
                         octo_updater.subprocess, "run",
-                        return_value=completed) as run:
+                        return_value=completed) as run, \
+                    mock.patch.object(octo_updater, "log") as logger:
                 result = octo_updater.discover_lutris_games(client_dir)
 
         self.assertEqual(result["status"], "ready")
@@ -216,6 +215,10 @@ class LutrisDiscoveryTests(unittest.TestCase):
         )
         self.assertNotIn("shell", run.call_args.kwargs)
         self.assertNotIn("--output-script", run.call_args.args[0])
+        self.assertEqual(
+            self._messages(logger),
+            '[Lutris] Matched "OctoWoW" (ID 42) via exact directory.',
+        )
 
     def test_reports_timeout_and_malformed_json_as_probe_errors(self):
         with mock.patch.object(
@@ -243,9 +246,9 @@ class LutrisDiscoveryTests(unittest.TestCase):
         self.assertEqual(malformed["status"], "error")
         messages = self._messages(malformed_logger)
         self.assertIn("Malformed or unexpected JSON output", messages)
-        self.assertIn("probe error, 0 matches", messages)
+        self.assertEqual(malformed_logger.call_count, 1)
 
-    def test_logs_no_match_runner_and_path_rejections(self):
+    def test_logs_one_concise_no_match_result(self):
         payload = json.dumps([
             {
                 "id": 41,
@@ -278,15 +281,10 @@ class LutrisDiscoveryTests(unittest.TestCase):
         self.assertEqual(result["status"], "ready")
         self.assertEqual(result["matches"], [])
         messages = self._messages(logger)
-        self.assertIn("Installed entries returned: 3", messages)
-        self.assertIn("runner is not literal 'wine'", messages)
-        self.assertIn("name='Wrong runner'", messages)
-        self.assertIn("not an exact directory or Wine-prefix", messages)
-        self.assertIn("target='/games/OctoWoW'", messages)
-        self.assertIn("candidate='/games/AnotherWoW'", messages)
-        self.assertIn("ID is not numeric", messages)
-        self.assertIn("Accepted directory matches: 0", messages)
-        self.assertIn("ready, 0 matches", messages)
+        self.assertEqual(
+            messages,
+            "[Lutris] No matching Wine entry for /games/OctoWoW.",
+        )
 
     def test_accepts_prefix_root_without_output_script_probe(self):
         client_dir = "/games/wrath/drive_c/world_of_warcraft"
@@ -318,10 +316,10 @@ class LutrisDiscoveryTests(unittest.TestCase):
         run.assert_called_once()
         self.assertNotIn("--output-script", run.call_args.args[0])
         messages = self._messages(logger)
-        self.assertIn("accepted as closest Wine-prefix ancestor", messages)
-        self.assertIn(f"target={client_dir!r}", messages)
-        self.assertIn("candidate='/games/wrath'", messages)
-        self.assertIn("Accepted directory matches: 1", messages)
+        self.assertEqual(
+            messages,
+            '[Lutris] Matched "Wrath" (ID 4) via Wine prefix.',
+        )
 
     def test_logs_unexpected_json_shape(self):
         completed = subprocess.CompletedProcess(["lutris"], 0, "{}", "")
@@ -379,7 +377,7 @@ class LutrisProbeLifecycleTests(unittest.TestCase):
         app._status_var.set.assert_called_once_with(
             "Multiple Lutris entries")
 
-    def test_retry_logs_cache_invalidation_and_starts_fresh_probe(self):
+    def test_retry_starts_fresh_probe_without_routine_log_noise(self):
         app = object.__new__(octo_updater.OctoUpdaterApp)
         app._game_path = mock.Mock()
         app._game_path.get.return_value = "/games/OctoWoW"
@@ -397,11 +395,7 @@ class LutrisProbeLifecycleTests(unittest.TestCase):
         with mock.patch.object(octo_updater.threading, "Thread") as thread:
             app._start_lutris_probe(force=True)
 
-        app._log_line.assert_called_once()
-        self.assertIn(
-            "Retry requested; invalidating cached discovery state",
-            app._log_line.call_args.args[0],
-        )
+        app._log_line.assert_not_called()
         self.assertEqual(app._lutris_state["status"], "probing")
         self.assertEqual(app._lutris_probe_token, 5)
         thread.assert_called_once()
