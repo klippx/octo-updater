@@ -45,16 +45,39 @@ else:
 
 
 def _default_app_data_dir() -> str:
-    base = os.environ.get("LOCALAPPDATA")
-    if base:
-        path = os.path.join(base, "OctoUpdater")
+    import sys
+
+    # --- Windows path ---
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA")
+        if base:
+            path = os.path.join(base, "OctoUpdater")
+            try:
+                os.makedirs(path, exist_ok=True)
+                return path
+            except OSError:
+                pass
+
+    # --- POSIX (Linux / macOS) path using XDG standard ---
+    else:
+        xdg_config = os.environ.get("XDG_CONFIG_HOME")
+        if not xdg_config or not os.path.isabs(xdg_config):
+            xdg_config = os.path.join(os.path.expanduser("~"), ".config")
+        path = os.path.join(xdg_config, "octo-updater")
         try:
             os.makedirs(path, exist_ok=True)
+            old_config = os.path.join(APP_DIR, "config.json")
+            new_config = os.path.join(path, "config.json")
+            if os.path.exists(old_config) and not os.path.exists(new_config):
+                try:
+                    shutil.move(old_config, new_config)
+                except OSError:
+                    return APP_DIR
             return path
         except OSError:
             pass
-    return APP_DIR
 
+    return APP_DIR
 
 APP_DATA_DIR = _default_app_data_dir()
 
@@ -586,7 +609,7 @@ def recover_protected_files(client_dir: str, files):
 
 
 def torrent_selection(client_dir: str, files, drop_mismatched=False,
-                      ignore_speech=False):
+                      ignore_speech=False, log_fn=None):
     """1-indexed list of torrent files that are missing or the wrong size on
     disk (aria2 --select-file), plus whether any were entirely missing."""
     need, missing = [], False
@@ -597,10 +620,14 @@ def torrent_selection(client_dir: str, files, drop_mismatched=False,
         try:
             size = os.path.getsize(dest)
         except OSError:
+            if log_fn:
+                log_fn(f"Missing file: {dest}\n", "dim")
             missing = True
             need.append(i + 1)
             continue
         if size != length:
+            if log_fn:
+                log_fn(f"Size mismatch on {dest}: expected {length}, got {size}\n", "dim")
             # oversized/corrupt file poisons resume — drop it; a short file is
             # kept so aria2 can resume it
             if drop_mismatched or size > length:
@@ -1018,8 +1045,18 @@ class VerifyWorker:
             # so it's never flagged); need == files missing or wrong-sized.
             ignore_speech = bool(load_config().get("ignore_speech", False))
             need, _missing = torrent_selection(self.out_dir, files,
-                                               ignore_speech=ignore_speech)
+                                               ignore_speech=ignore_speech,
+                                               log_fn=self.log)
+            if need:
+                self.log("Torrents need update!", "dim")
+            else:
+                self.log("Torrents up to date...", "dim")
+
             have_exe = os.path.exists(os.path.join(self.out_dir, "WoW.exe"))
+            if have_exe:
+                self.log("Executable found...", "dim")
+            else:
+                self.log("Executable not found!", "dim")
 
             if have_exe and not need:
                 self.log("Everything is up to date!", "ok")
