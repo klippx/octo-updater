@@ -45,16 +45,32 @@ else:
 
 
 def _default_app_data_dir() -> str:
-    base = os.environ.get("LOCALAPPDATA")
-    if base:
-        path = os.path.join(base, "OctoUpdater")
+    import sys
+
+    # --- Windows path ---
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA")
+        if base:
+            path = os.path.join(base, "OctoUpdater")
+            try:
+                os.makedirs(path, exist_ok=True)
+                return path
+            except OSError:
+                pass
+
+    # --- POSIX (Linux / macOS) path using XDG standard ---
+    else:
+        xdg_config = os.environ.get("XDG_CONFIG_HOME")
+        if not xdg_config:
+            xdg_config = os.path.join(os.path.expanduser("~"), ".config")
+        path = os.path.join(xdg_config, "octo-updater")
         try:
             os.makedirs(path, exist_ok=True)
             return path
         except OSError:
             pass
-    return APP_DIR
 
+    return APP_DIR
 
 APP_DATA_DIR = _default_app_data_dir()
 
