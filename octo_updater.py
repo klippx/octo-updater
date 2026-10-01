@@ -602,7 +602,7 @@ def recover_protected_files(client_dir: str, files):
 
 
 def torrent_selection(client_dir: str, files, drop_mismatched=False,
-                      ignore_speech=False):
+                      ignore_speech=False, log_fn=None):
     """1-indexed list of torrent files that are missing or the wrong size on
     disk (aria2 --select-file), plus whether any were entirely missing."""
     need, missing = [], False
@@ -613,10 +613,14 @@ def torrent_selection(client_dir: str, files, drop_mismatched=False,
         try:
             size = os.path.getsize(dest)
         except OSError:
+            if log_fn:
+                log_fn(f"Missing file: {dest}\n", "dim")
             missing = True
             need.append(i + 1)
             continue
         if size != length:
+            if log_fn:
+                log_fn(f"Size mismatch on {dest}: expected {length}, got {size}\n", "dim")
             # oversized/corrupt file poisons resume — drop it; a short file is
             # kept so aria2 can resume it
             if drop_mismatched or size > length:
@@ -1034,8 +1038,18 @@ class VerifyWorker:
             # so it's never flagged); need == files missing or wrong-sized.
             ignore_speech = bool(load_config().get("ignore_speech", False))
             need, _missing = torrent_selection(self.out_dir, files,
-                                               ignore_speech=ignore_speech)
+                                               ignore_speech=ignore_speech,
+                                               log_fn=self.log)
+            if need:
+                self.log("Torrents need update!", "dim")
+            else:
+                self.log("Torrents up to date...", "dim")
+
             have_exe = os.path.exists(os.path.join(self.out_dir, "WoW.exe"))
+            if have_exe:
+                self.log("Executable found...", "dim")
+            else:
+                self.log("Executable not found!", "dim")
 
             if have_exe and not need:
                 self.log("Everything is up to date!", "ok")
