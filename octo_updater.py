@@ -310,13 +310,14 @@ def _lutris_candidate_label(game) -> str:
 
 def matching_lutris_games(raw_json: str, client_dir: str,
                           diagnostics: list[str] | None = None) -> list[dict]:
-    """Validate Lutris JSON and return exact JSON-directory Wine matches."""
+    """Return exact or closest Wine-prefix directory matches."""
     games = json.loads(raw_json)
     if not isinstance(games, list):
         raise ValueError("Lutris returned JSON that is not a game list")
 
     wanted = _normalized_real_path(client_dir)
-    matches = []
+    exact_matches = []
+    prefix_matches = []
     rejections = []
     for game in games:
         label = _lutris_candidate_label(game)
@@ -335,17 +336,56 @@ def matching_lutris_games(raw_json: str, client_dir: str,
             rejections.append(f"{label}: rejected (directory is missing or invalid)")
             continue
         candidate = _normalized_real_path(directory)
-        if candidate != wanted:
-            rejections.append(
-                f"{label}: rejected (normalized directory mismatch: "
-                f"target={wanted!r}, candidate={candidate!r})")
-            continue
-        matches.append({
+        match = {
             "id": game_id,
             "name": str(game.get("name") or f"Lutris game {game_id}"),
             "runner": "wine",
             "directory": directory,
-        })
+        }
+        if candidate == wanted:
+            exact_matches.append(match)
+            continue
+        try:
+            relative = os.path.relpath(wanted, candidate)
+        except ValueError:
+            relative = os.pardir
+        relative_parts = Path(relative).parts
+        if (not relative_parts or relative_parts[0].casefold() != "drive_c"):
+            rejections.append(
+                f"{label}: rejected (not an exact directory or Wine-prefix "
+                f"drive_c ancestor: target={wanted!r}, "
+                f"candidate={candidate!r})")
+            continue
+        prefix_matches.append((candidate, match, label))
+
+    if exact_matches:
+        matches = exact_matches
+        for candidate, _, label in prefix_matches:
+            rejections.append(
+                f"{label}: rejected (exact directory match takes precedence "
+                f"over Wine-prefix ancestor {candidate!r})")
+    elif prefix_matches:
+        closest_depth = max(
+            len(Path(candidate).parts)
+            for candidate, _, _ in prefix_matches)
+        closest = [
+            (candidate, match, label)
+            for candidate, match, label in prefix_matches
+            if len(Path(candidate).parts) == closest_depth
+        ]
+        matches = [match for _, match, _ in closest]
+        closest_ids = {match["id"] for _, match, _ in closest}
+        for candidate, match, label in prefix_matches:
+            if match["id"] in closest_ids:
+                rejections.append(
+                    f"{label}: accepted as closest Wine-prefix ancestor "
+                    f"(target={wanted!r}, candidate={candidate!r})")
+            else:
+                rejections.append(
+                    f"{label}: rejected (a closer Wine-prefix ancestor "
+                    f"matches target={wanted!r}; candidate={candidate!r})")
+    else:
+        matches = []
     if diagnostics is not None:
         diagnostics.extend(rejections[:LUTRIS_LOG_REJECTION_LIMIT])
         if len(rejections) > LUTRIS_LOG_REJECTION_LIMIT:
@@ -362,14 +402,14 @@ def lutris_launch_command(lutris: str, game_id: str) -> list[str]:
 
 
 def discover_lutris_games(client_dir: str) -> dict:
-    """Discover exact Wine-runner matches through Lutris's supported CLI."""
+    """Discover Wine-runner directory matches through Lutris's supported CLI."""
     normalized = _normalized_real_path(client_dir)
     log(f"\n[Lutris] Discovery started; normalized game directory: "
         f"{_bounded_log_detail(normalized)}", "acct")
     lutris = shutil.which("lutris")
     if not lutris:
         log("[Lutris] PATH lookup: 'lutris' was not found.", "err")
-        log("[Lutris] Discovery finished: missing tool, 0 exact matches.",
+        log("[Lutris] Discovery finished: missing tool, 0 matches.",
             "dim")
         return {"status": "missing", "matches": [], "lutris": None}
     log(f"[Lutris] PATH lookup resolved executable: {lutris}", "dim")
@@ -395,9 +435,8 @@ def discover_lutris_games(client_dir: str) -> dict:
         log(f"[Lutris] Installed entries returned: {len(games)}.", "dim")
         for detail in diagnostics:
             log(f"[Lutris] Candidate {_bounded_log_detail(detail)}", "dim")
-        log(f"[Lutris] Exact normalized directory matches: {len(matches)}.",
-            "dim")
-        log(f"[Lutris] Discovery finished: ready, {len(matches)} exact "
+        log(f"[Lutris] Accepted directory matches: {len(matches)}.", "dim")
+        log(f"[Lutris] Discovery finished: ready, {len(matches)} "
             f"match{'es' if len(matches) != 1 else ''}.", "dim")
         return {"status": "ready", "matches": matches, "lutris": lutris}
     except subprocess.TimeoutExpired:
@@ -413,7 +452,7 @@ def discover_lutris_games(client_dir: str) -> dict:
             f"{_bounded_log_detail(error)}", "err")
     except (subprocess.SubprocessError, RuntimeError) as e:
         error = str(e)
-    log("[Lutris] Discovery finished: probe error, 0 exact matches.", "dim")
+    log("[Lutris] Discovery finished: probe error, 0 matches.", "dim")
     return {
             "status": "error", "matches": [], "lutris": lutris,
             "error": error,
@@ -6645,13 +6684,13 @@ class OctoUpdaterApp(tk.Tk):
                 f"{result.get('error', 'unknown error')}", "err")
         selected = result.get("selected")
         if selected:
-            reason = ("single exact match" if len(matches) == 1
+            reason = ("single directory match" if len(matches) == 1
                       else f"persisted game ID {selected['id']}")
             log(f"[Lutris] Final UI state: PLAY ({reason}).", "ok")
         elif len(matches) > 1:
             log(
                 f"[Lutris] Final UI state: CHOOSE LAUNCHER "
-                f"({len(matches)} exact matches, no valid saved selection).",
+                f"({len(matches)} directory matches, no valid saved selection).",
                 "acct")
         elif result.get("status") == "missing":
             log(
@@ -6664,7 +6703,7 @@ class OctoUpdaterApp(tk.Tk):
         else:
             log(
                 f"[Lutris] Final UI state: HOW TO PLAY "
-                f"(no exact Wine-runner match for "
+                f"(no Wine-runner directory match for "
                 f"{_bounded_log_detail(path)}).", "acct")
         self._refresh_ready_state()
 
@@ -6803,11 +6842,11 @@ class OctoUpdaterApp(tk.Tk):
         retry = messagebox.askretrycancel(
             "Launching the game",
             "Octo Updater can use an existing Wine-runner Lutris entry whose "
-            "game directory exactly matches this game folder:\n\n"
+            "game directory matches this game folder or is its closest Wine "
+            "prefix containing drive_c:\n\n"
             f"{client_dir}\n\n"
-            "In Lutris, set Game directory / Working directory to the exact "
-            "folder above, not the Wine prefix root. Separately, set the "
-            f"executable to {exe_lbl}. VanillaFixes.exe is required to load "
+            "Separately, verify Lutris is configured to launch "
+            f"{exe_lbl}. VanillaFixes.exe is required to load "
             "installed mod DLLs when it is available. Octo Updater does not "
             "inspect Lutris's saved executable.\n\n"
             "You can also keep launching the game manually through Steam, "

@@ -93,6 +93,75 @@ class LutrisMatchingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "not a game list"):
             octo_updater.matching_lutris_games("{}", "/tmp/game")
 
+    def test_exact_match_takes_precedence_over_prefix_ancestor(self):
+        games = [
+            {
+                "id": 4,
+                "name": "Prefix",
+                "runner": "wine",
+                "directory": "/games/wrath",
+            },
+            {
+                "id": 5,
+                "name": "Exact",
+                "runner": "wine",
+                "directory": "/games/wrath/drive_c/world_of_warcraft",
+            },
+        ]
+
+        matches = octo_updater.matching_lutris_games(
+            json.dumps(games),
+            "/games/wrath/drive_c/world_of_warcraft",
+        )
+
+        self.assertEqual([game["id"] for game in matches], ["5"])
+
+    def test_uses_closest_wine_prefix_ancestor_only(self):
+        games = [
+            {
+                "id": 3,
+                "name": "Shallow prefix",
+                "runner": "wine",
+                "directory": "/games",
+            },
+            {
+                "id": 4,
+                "name": "Wrath",
+                "runner": "wine",
+                "directory": "/games/wrath",
+            },
+        ]
+
+        matches = octo_updater.matching_lutris_games(
+            json.dumps(games),
+            "/games/wrath/drive_c/world_of_warcraft",
+        )
+
+        self.assertEqual([game["id"] for game in matches], ["4"])
+
+    def test_rejects_generic_ancestor_and_similar_string_prefix(self):
+        games = [
+            {
+                "id": 3,
+                "name": "Generic games folder",
+                "runner": "wine",
+                "directory": "/games",
+            },
+            {
+                "id": 4,
+                "name": "Similar name",
+                "runner": "wine",
+                "directory": "/games/wrath",
+            },
+        ]
+
+        matches = octo_updater.matching_lutris_games(
+            json.dumps(games),
+            "/games/wrathguild/drive_c/world_of_warcraft",
+        )
+
+        self.assertEqual(matches, [])
+
 
 class LutrisDiscoveryTests(unittest.TestCase):
     @staticmethod
@@ -110,7 +179,7 @@ class LutrisDiscoveryTests(unittest.TestCase):
         messages = self._messages(logger)
         self.assertIn("normalized game directory: /games/OctoWoW", messages)
         self.assertIn("'lutris' was not found", messages)
-        self.assertIn("missing tool, 0 exact matches", messages)
+        self.assertIn("missing tool, 0 matches", messages)
 
     def test_discovers_exact_match_without_output_script_probe(self):
         with tempfile.TemporaryDirectory() as client_dir:
@@ -174,7 +243,7 @@ class LutrisDiscoveryTests(unittest.TestCase):
         self.assertEqual(malformed["status"], "error")
         messages = self._messages(malformed_logger)
         self.assertIn("Malformed or unexpected JSON output", messages)
-        self.assertIn("probe error, 0 exact matches", messages)
+        self.assertIn("probe error, 0 matches", messages)
 
     def test_logs_no_match_runner_and_path_rejections(self):
         payload = json.dumps([
@@ -212,14 +281,14 @@ class LutrisDiscoveryTests(unittest.TestCase):
         self.assertIn("Installed entries returned: 3", messages)
         self.assertIn("runner is not literal 'wine'", messages)
         self.assertIn("name='Wrong runner'", messages)
-        self.assertIn("normalized directory mismatch", messages)
+        self.assertIn("not an exact directory or Wine-prefix", messages)
         self.assertIn("target='/games/OctoWoW'", messages)
         self.assertIn("candidate='/games/AnotherWoW'", messages)
         self.assertIn("ID is not numeric", messages)
-        self.assertIn("Exact normalized directory matches: 0", messages)
-        self.assertIn("ready, 0 exact matches", messages)
+        self.assertIn("Accepted directory matches: 0", messages)
+        self.assertIn("ready, 0 matches", messages)
 
-    def test_rejects_prefix_root_without_output_script_probe(self):
+    def test_accepts_prefix_root_without_output_script_probe(self):
         client_dir = "/games/wrath/drive_c/world_of_warcraft"
         payload = json.dumps([{
             "id": 4,
@@ -237,13 +306,22 @@ class LutrisDiscoveryTests(unittest.TestCase):
                 mock.patch.object(octo_updater, "log") as logger:
             result = octo_updater.discover_lutris_games(client_dir)
 
-        self.assertEqual(result["matches"], [])
+        self.assertEqual(
+            result["matches"],
+            [{
+                "id": "4",
+                "name": "Wrath",
+                "runner": "wine",
+                "directory": "/games/wrath",
+            }],
+        )
         run.assert_called_once()
         self.assertNotIn("--output-script", run.call_args.args[0])
         messages = self._messages(logger)
-        self.assertIn("normalized directory mismatch", messages)
+        self.assertIn("accepted as closest Wine-prefix ancestor", messages)
         self.assertIn(f"target={client_dir!r}", messages)
         self.assertIn("candidate='/games/wrath'", messages)
+        self.assertIn("Accepted directory matches: 1", messages)
 
     def test_logs_unexpected_json_shape(self):
         completed = subprocess.CompletedProcess(["lutris"], 0, "{}", "")

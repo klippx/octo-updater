@@ -118,10 +118,10 @@ verification/updates.
   inside its compatibility environment.
 - Native Linux source execution supports **PLAY** through an existing
   [Lutris](https://lutris.net/) game entry. The entry must use the Wine runner
-  and its game directory must exactly match the folder configured in Octo
-  Updater. macOS source execution supports downloading, updating, and
-  configuring client files, but the Windows game must still be launched
-  separately.
+  and its game directory must either match the folder configured in Octo
+  Updater or be the closest Wine prefix containing it under `drive_c`. macOS
+  source execution supports downloading, updating, and configuring client
+  files, but the Windows game must still be launched separately.
 - **Python 3.10+** — only if running from source. Runs on the standard
   library, and will also use [`certifi`](https://pypi.org/project/certifi/) if
   installed, for more robust TLS verification on machines with an out-of-date
@@ -167,19 +167,22 @@ The updater keeps its data in a per-user app-data folder.
 ### PLAY on native Linux
 
 Octo Updater automatically asks Lutris for its installed games and matches only
-a Wine-runner entry whose game directory resolves to the configured **Game
-folder** exactly. A Wine prefix or installation root that contains the game
-folder is not a match. One match enables **PLAY** immediately. If multiple
-entries use the same directory, **CHOOSE LAUNCHER** lets you select one; only
-that Lutris game ID is saved for the current game folder.
+a Wine-runner entry whose game directory resolves exactly to the configured
+**Game folder**. If there is no exact match, it accepts the closest matching
+Wine-prefix directory only when the game folder is beneath that directory's
+`drive_c`. This is a path-component comparison, not a string-prefix guess;
+shallower matching prefixes are discarded. One match enables **PLAY**
+immediately. If multiple entries have the same closest directory,
+**CHOOSE LAUNCHER** lets you select one; only that Lutris game ID is saved for
+the current game folder.
 
 If no match is found, **HOW TO PLAY** shows the folder and executable to use:
 
 1. In Lutris, add a locally installed Windows game.
-2. Set **Game directory / Working directory** to the exact OctoWoW game folder
-   shown by Octo Updater—the directory containing `WoW.exe` and
-   `VanillaFixes.exe`—not the Wine prefix root.
-3. Separately set **Game options → Executable** to `VanillaFixes.exe` when
+2. Set **Game directory / Working directory** to either the exact OctoWoW game
+   folder shown by Octo Updater or its Wine prefix root containing the game
+   under `drive_c`.
+3. Set **Game options → Executable** to `VanillaFixes.exe` when
    present (required to load installed mod DLLs), otherwise `WoW.exe`.
 4. Retry detection from **HOW TO PLAY**.
 
