@@ -2840,11 +2840,32 @@ def _format_news_date(iso: str) -> str:
         return iso
 
 
+def _read_news_json(url: str):
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    with secure_urlopen(req, timeout=NEWS_TIMEOUT) as response:
+        raw = response.read()
+        status = response.getcode()
+        content_type = response.headers.get("Content-Type", "unknown")
+        final = urlsplit(response.geturl())
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as exc:
+        preview = re.sub(r"\s+", " ", raw.decode("utf-8", "replace")).strip()
+        preview = re.sub(
+            r"([?&][^=\s]+)=([^&\s]+)", r"\1=<redacted>", preview)
+        if len(preview) > 200:
+            preview = preview[:200] + "..."
+        raise ValueError(
+            "invalid JSON response: "
+            f"status={status}, content-type={content_type!r}, "
+            f"bytes={len(raw)}, final={final.hostname}{final.path}, "
+            f"body={preview!r}"
+        ) from exc
+
+
 def fetch_patch_notes() -> list:
     """Patch-notes list → [{id, title, date, body, url?, author?}, …]"""
-    req = urllib.request.Request(PATCHNOTES_URL, headers={"User-Agent": UA})
-    with secure_urlopen(req, timeout=NEWS_TIMEOUT) as r:
-        data = json.load(r)
+    data = _read_news_json(PATCHNOTES_URL)
     items = data.get("items", [])
     # The feed lists topics in forum order — show newest first (ISO dates
     # with a fixed offset sort correctly as strings).
@@ -2854,9 +2875,7 @@ def fetch_patch_notes() -> list:
 
 def fetch_featured_post() -> dict | None:
     """Latest announcements-forum post → {id, title, author?, date, url, html}"""
-    req = urllib.request.Request(NEWS_FEATURED_URL, headers={"User-Agent": UA})
-    with secure_urlopen(req, timeout=NEWS_TIMEOUT) as r:
-        data = json.load(r)
+    data = _read_news_json(NEWS_FEATURED_URL)
     return data if isinstance(data, dict) and data.get("id") else None
 
 # ──────────────────────────────────────────────────────────────────────────────
