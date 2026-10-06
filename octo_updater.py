@@ -3481,13 +3481,20 @@ class OctoUpdaterApp(tk.Tk):
         self._render_featured(None, loading=True)
 
         def worker():
-            feat, err = None, ""
+            feat, err, detail = None, "", ""
             try:
                 feat = fetch_featured_post()
-            except Exception:
+            except Exception as exc:
                 err = "Couldn't reach the news feed."
+                detail = (
+                    f"[news] Featured feed request failed "
+                    f"({NEWS_FEATURED_URL}): "
+                    f"{type(exc).__name__}: {exc!r}\n"
+                )
 
             def apply():
+                if detail:
+                    self._log_line(detail, "dim")
                 self._feat_ts  = time.time()
                 self._featured = feat
                 self._render_featured(feat, error=err)
@@ -3502,13 +3509,20 @@ class OctoUpdaterApp(tk.Tk):
         self._render_patch_notes(None, loading=True)
 
         def worker():
-            items, err = None, ""
+            items, err, detail = None, "", ""
             try:
                 items = fetch_patch_notes()
-            except Exception:
+            except Exception as exc:
                 err = "Couldn't reach the news feed."
+                detail = (
+                    f"[news] Patch notes feed request failed "
+                    f"({PATCHNOTES_URL}): "
+                    f"{type(exc).__name__}: {exc!r}\n"
+                )
 
             def apply():
+                if detail:
+                    self._log_line(detail, "dim")
                 self._patch_ts    = time.time()
                 self._patch_items = items
                 self._render_patch_notes(items, error=err)
