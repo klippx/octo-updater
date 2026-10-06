@@ -157,6 +157,8 @@ the updater at the existing game folder.
 python octo_updater.py
 ```
 
+The updater keeps its data in a per-user app-data folder.
+
 Native Linux/macOS source mode can manage the client files, but launch the game
 separately through Wine/Proton instead of using **PLAY**.
 
