@@ -93,7 +93,7 @@ class LutrisMatchingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "not a game list"):
             octo_updater.matching_lutris_games("{}", "/tmp/game")
 
-    def test_exact_match_takes_precedence_over_prefix_ancestor(self):
+    def test_exact_match_takes_precedence_over_less_similar_path(self):
         games = [
             {
                 "id": 4,
@@ -105,18 +105,18 @@ class LutrisMatchingTests(unittest.TestCase):
                 "id": 5,
                 "name": "Exact",
                 "runner": "wine",
-                "directory": "/games/wrath/drive_c/world_of_warcraft",
+                "directory": "/games/wrath/game-files",
             },
         ]
 
         matches = octo_updater.matching_lutris_games(
             json.dumps(games),
-            "/games/wrath/drive_c/world_of_warcraft",
+            "/games/wrath/game-files",
         )
 
         self.assertEqual([game["id"] for game in matches], ["5"])
 
-    def test_uses_closest_wine_prefix_ancestor_only(self):
+    def test_uses_entry_with_deepest_shared_path(self):
         games = [
             {
                 "id": 3,
@@ -134,38 +134,38 @@ class LutrisMatchingTests(unittest.TestCase):
 
         matches = octo_updater.matching_lutris_games(
             json.dumps(games),
-            "/games/wrath/drive_c/world_of_warcraft",
+            "/games/wrath/arbitrary/deep/game-files",
         )
 
         self.assertEqual([game["id"] for game in matches], ["4"])
 
-    def test_rejects_generic_ancestor_and_similar_string_prefix(self):
+    def test_uses_path_components_not_similar_string_prefixes(self):
         games = [
-            {
-                "id": 3,
-                "name": "Generic games folder",
-                "runner": "wine",
-                "directory": "/games",
-            },
             {
                 "id": 4,
                 "name": "Similar name",
                 "runner": "wine",
                 "directory": "/games/wrath",
             },
+            {
+                "id": 5,
+                "name": "Component match",
+                "runner": "wine",
+                "directory": "/games/wrathguild/runtime",
+            },
         ]
 
         matches = octo_updater.matching_lutris_games(
             json.dumps(games),
-            "/games/wrathguild/drive_c/world_of_warcraft",
+            "/games/wrathguild/arbitrary/game-files",
         )
 
-        self.assertEqual(matches, [])
+        self.assertEqual([game["id"] for game in matches], ["5"])
 
-    def test_matches_separate_client_and_wine_sibling_layout(self):
+    def test_matches_arbitrarily_named_sibling_directories(self):
         with tempfile.TemporaryDirectory() as game_root:
-            client_dir = os.path.join(game_root, "client")
-            wine_dir = os.path.join(game_root, "wine")
+            client_dir = os.path.join(game_root, "any-game-folder")
+            wine_dir = os.path.join(game_root, "any-prefix-folder")
             os.makedirs(client_dir)
             os.makedirs(wine_dir)
             games = [{
@@ -180,11 +180,10 @@ class LutrisMatchingTests(unittest.TestCase):
 
         self.assertEqual([game["id"] for game in matches], ["4"])
 
-    def test_matches_game_root_for_separate_client_and_wine_layout(self):
+    def test_matches_arbitrarily_named_directory_ancestor(self):
         with tempfile.TemporaryDirectory() as game_root:
-            client_dir = os.path.join(game_root, "client")
+            client_dir = os.path.join(game_root, "files", "game")
             os.makedirs(client_dir)
-            os.makedirs(os.path.join(game_root, "wine"))
             games = [{
                 "id": 4,
                 "name": "Wrath",
@@ -197,29 +196,34 @@ class LutrisMatchingTests(unittest.TestCase):
 
         self.assertEqual([game["id"] for game in matches], ["4"])
 
-    def test_rejects_arbitrary_sibling_and_missing_wine_layout(self):
+    def test_matches_arbitrary_cousin_layout_by_shared_path(self):
         with tempfile.TemporaryDirectory() as game_root:
-            client_dir = os.path.join(game_root, "client")
+            client_dir = os.path.join(game_root, "game", "files")
             os.makedirs(client_dir)
-            other_dir = os.path.join(game_root, "prefix")
+            other_dir = os.path.join(game_root, "runner", "prefix")
             os.makedirs(other_dir)
-            games = [
-                {
-                    "id": 4,
-                    "name": "Arbitrary sibling",
-                    "runner": "wine",
-                    "directory": other_dir,
-                },
-                {
-                    "id": 5,
-                    "name": "Root without wine",
-                    "runner": "wine",
-                    "directory": game_root,
-                },
-            ]
+            games = [{
+                "id": 4,
+                "name": "Cousin directory",
+                "runner": "wine",
+                "directory": other_dir,
+            }]
 
             matches = octo_updater.matching_lutris_games(
                 json.dumps(games), client_dir)
+
+        self.assertEqual([game["id"] for game in matches], ["4"])
+
+    def test_rejects_root_only_overlap(self):
+        games = [{
+            "id": 4,
+            "name": "Unrelated",
+            "runner": "wine",
+            "directory": "/opt/unrelated",
+        }]
+
+        matches = octo_updater.matching_lutris_games(
+            json.dumps(games), "/games/wow")
 
         self.assertEqual(matches, [])
 
@@ -278,7 +282,8 @@ class LutrisDiscoveryTests(unittest.TestCase):
         self.assertNotIn("--output-script", run.call_args.args[0])
         self.assertEqual(
             self._messages(logger),
-            '[Lutris] Matched "OctoWoW" (ID 42) via exact directory.',
+            '[Lutris] Matched "OctoWoW" (ID 42) by '
+            'closest shared directory path.',
         )
 
     def test_reports_timeout_and_malformed_json_as_probe_errors(self):
@@ -321,7 +326,7 @@ class LutrisDiscoveryTests(unittest.TestCase):
                 "id": 42,
                 "name": "Wrong folder",
                 "runner": "wine",
-                "directory": "/games/AnotherWoW",
+                "directory": "/opt/AnotherWoW",
             },
             {
                 "id": "not-numeric",
@@ -349,8 +354,8 @@ class LutrisDiscoveryTests(unittest.TestCase):
         self.assertIn("Candidate check:", messages)
         self.assertEqual(logger.call_count, 1)
 
-    def test_accepts_prefix_root_without_output_script_probe(self):
-        client_dir = "/games/wrath/drive_c/world_of_warcraft"
+    def test_accepts_closest_shared_path_without_output_script_probe(self):
+        client_dir = "/games/wrath/arbitrary/game-files"
         payload = json.dumps([{
             "id": 4,
             "name": "Wrath",
@@ -381,13 +386,13 @@ class LutrisDiscoveryTests(unittest.TestCase):
         messages = self._messages(logger)
         self.assertEqual(
             messages,
-            '[Lutris] Matched "Wrath" (ID 4) via Wine prefix.',
+            '[Lutris] Matched "Wrath" (ID 4) by closest shared directory path.',
         )
 
-    def test_accepts_separate_client_and_wine_layout(self):
+    def test_accepts_arbitrarily_named_sibling_directory(self):
         with tempfile.TemporaryDirectory() as game_root:
-            client_dir = os.path.join(game_root, "client")
-            wine_dir = os.path.join(game_root, "wine")
+            client_dir = os.path.join(game_root, "game-files")
+            wine_dir = os.path.join(game_root, "runtime-data")
             os.makedirs(client_dir)
             os.makedirs(wine_dir)
             payload = json.dumps([{
@@ -411,8 +416,8 @@ class LutrisDiscoveryTests(unittest.TestCase):
         self.assertNotIn("--output-script", run.call_args.args[0])
         self.assertEqual(
             self._messages(logger),
-            '[Lutris] Matched "Wrath" (ID 4) via '
-            'separate client/Wine layout.',
+            '[Lutris] Matched "Wrath" (ID 4) by '
+            'closest shared directory path.',
         )
 
     def test_logs_unexpected_json_shape(self):
@@ -498,7 +503,7 @@ class LutrisProbeLifecycleTests(unittest.TestCase):
     def test_play_state_executable_info_does_not_offer_retry(self):
         app = object.__new__(octo_updater.OctoUpdaterApp)
         app._game_path = mock.Mock()
-        app._game_path.get.return_value = "/games/wrath/drive_c/wow"
+        app._game_path.get.return_value = "/games/wrath/game-files"
         app._lutris_state = {
             "selected": {"id": "4", "name": "Wrath"},
         }

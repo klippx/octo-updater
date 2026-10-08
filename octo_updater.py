@@ -308,40 +308,31 @@ def _lutris_candidate_label(game) -> str:
     )
 
 
-def _lutris_directory_match_kind(candidate: str, wanted: str) -> str | None:
-    if candidate == wanted:
-        return "exact directory"
-
+def _lutris_directory_score(candidate: str, wanted: str) -> tuple[int, int] | None:
     try:
-        relative_parts = Path(os.path.relpath(wanted, candidate)).parts
+        common = os.path.commonpath([candidate, wanted])
     except ValueError:
-        relative_parts = ()
-    if relative_parts and relative_parts[0].casefold() == "drive_c":
-        return "Wine prefix"
-
-    wanted_path = Path(wanted)
-    candidate_path = Path(candidate)
-    if (wanted_path.name.casefold() == "client"
-            and candidate_path.name.casefold() == "wine"
-            and wanted_path.parent == candidate_path.parent):
-        return "separate client/Wine layout"
-    if (wanted_path.name.casefold() == "client"
-            and wanted_path.parent == candidate_path
-            and os.path.isdir(os.path.join(candidate, "wine"))):
-        return "separate client/Wine layout"
-    return None
+        return None
+    if common == os.path.sep:
+        return None
+    common_depth = len(Path(common).parts)
+    distance = (
+        len(Path(candidate).parts)
+        + len(Path(wanted).parts)
+        - (2 * common_depth)
+    )
+    return common_depth, -distance
 
 
 def matching_lutris_games(raw_json: str, client_dir: str,
                           diagnostics: list[str] | None = None) -> list[dict]:
-    """Return exact or closest supported Lutris directory matches."""
+    """Return the Wine entries with the strongest directory-path similarity."""
     games = json.loads(raw_json)
     if not isinstance(games, list):
         raise ValueError("Lutris returned JSON that is not a game list")
 
     wanted = _normalized_real_path(client_dir)
-    exact_matches = []
-    fallback_matches = []
+    scored_matches = []
     rejections = []
     for game in games:
         label = _lutris_candidate_label(game)
@@ -366,47 +357,37 @@ def matching_lutris_games(raw_json: str, client_dir: str,
             "runner": "wine",
             "directory": directory,
         }
-        match_kind = _lutris_directory_match_kind(candidate, wanted)
-        if match_kind == "exact directory":
-            exact_matches.append(match)
-            continue
-        if match_kind is None:
+        score = _lutris_directory_score(candidate, wanted)
+        if score is None:
             rejections.append(
-                f"{label}: rejected (not an exact directory, Wine-prefix "
-                f"drive_c ancestor, or separate client/Wine layout: "
+                f"{label}: rejected (no shared directory beyond filesystem "
+                f"root: "
                 f"target={wanted!r}, "
                 f"candidate={candidate!r})")
             continue
-        fallback_matches.append((candidate, match, label, match_kind))
+        scored_matches.append((score, candidate, match, label))
 
-    if exact_matches:
-        matches = exact_matches
-        for candidate, _, label, match_kind in fallback_matches:
+    best_score = max(
+        (score for score, _, _, _ in scored_matches),
+        default=None,
+    )
+    matches = [
+        match for score, _, match, _ in scored_matches
+        if score == best_score
+    ]
+    closest_ids = {match["id"] for match in matches}
+    for score, candidate, match, label in scored_matches:
+        common_depth, negative_distance = score
+        if match["id"] in closest_ids:
             rejections.append(
-                f"{label}: rejected (exact directory match takes precedence "
-                f"over {match_kind} {candidate!r})")
-    elif fallback_matches:
-        closest_depth = max(
-            len(Path(candidate).parts)
-            for candidate, _, _, _ in fallback_matches)
-        closest = [
-            (candidate, match, label, match_kind)
-            for candidate, match, label, match_kind in fallback_matches
-            if len(Path(candidate).parts) == closest_depth
-        ]
-        matches = [match for _, match, _, _ in closest]
-        closest_ids = {match["id"] for _, match, _, _ in closest}
-        for candidate, match, label, match_kind in fallback_matches:
-            if match["id"] in closest_ids:
-                rejections.append(
-                    f"{label}: accepted as closest {match_kind} "
-                    f"(target={wanted!r}, candidate={candidate!r})")
-            else:
-                rejections.append(
-                    f"{label}: rejected (a closer supported directory "
-                    f"matches target={wanted!r}; candidate={candidate!r})")
-    else:
-        matches = []
+                f"{label}: accepted as closest shared directory path "
+                f"(common depth={common_depth}, distance={-negative_distance}, "
+                f"target={wanted!r}, candidate={candidate!r})")
+        else:
+            rejections.append(
+                f"{label}: rejected (another Wine entry has a closer shared "
+                f"directory path to target={wanted!r}; "
+                f"candidate={candidate!r})")
     if diagnostics is not None:
         diagnostics.extend(rejections[:LUTRIS_LOG_REJECTION_LIMIT])
         if len(rejections) > LUTRIS_LOG_REJECTION_LIMIT:
@@ -448,10 +429,8 @@ def discover_lutris_games(client_dir: str) -> dict:
             result.stdout, client_dir, diagnostics)
         if len(matches) == 1:
             game = matches[0]
-            match_kind = _lutris_directory_match_kind(
-                _normalized_real_path(game["directory"]), normalized)
             log(f'[Lutris] Matched "{game["name"]}" (ID {game["id"]}) '
-                f"via {match_kind}.", "ok")
+                "by closest shared directory path.", "ok")
         elif len(matches) > 1:
             log(f"[Lutris] Found {len(matches)} matching entries; "
                 "choose which one PLAY should use.", "acct")
@@ -6814,10 +6793,8 @@ class OctoUpdaterApp(tk.Tk):
             return
         retry = messagebox.askretrycancel(
             "Launching the game",
-            "Octo Updater can use an existing Wine-runner Lutris entry whose "
-            "game directory matches this game folder or is its closest Wine "
-            "prefix containing drive_c. It also recognizes the split layout "
-            "<game root>/client and <game root>/wine:\n\n"
+            "Octo Updater can use the Wine-runner Lutris entry whose reported "
+            "directory has the closest shared path with this game folder:\n\n"
             f"{client_dir}\n\n"
             "Separately, verify Lutris is configured to launch "
             f"{exe_lbl}. VanillaFixes.exe is required to load "
