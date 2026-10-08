@@ -62,7 +62,9 @@ Codeberg releases and registered in `dlls.txt`:
 - The required HD pack download is roughly 9.44 GiB (10.14 GB decimal).
   Installation verifies the release manifest and every file's SHA-256, stages
   all content before changing the game folder, and uses a journaled transaction
-  with rollback/recovery.
+  with rollback/recovery. Existing files that exactly match the selected
+  release's size and SHA-256 are reused in place, so reinstalling after removal
+  does not download the preserved HD MPQs again.
   Updating preserves `HDToggle.ini`, `HDToggle.log`, SavedVariables, and optional
   packs. Removing HD Switch follows upstream semantics: it removes the root DLL,
   runtime INI/log, addon, and loader registration while leaving all HD MPQs in

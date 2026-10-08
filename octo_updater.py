@@ -3613,22 +3613,48 @@ def install_octowow_hd(
     manifest = release.get("hd_manifest") or _fetch_octowow_hd_manifest(release)
     version = manifest["release"]
     total = manifest["total_size"]
-    margin = max(total // 20, 64 * 1024 * 1024)
-    if shutil.disk_usage(client_dir).free < total + margin:
+    reusable = {}
+    for item in manifest["files"]:
+        installed = os.path.join(client_dir, *item["dest"].split("/"))
+        try:
+            if (os.path.isfile(installed) and not os.path.islink(installed)
+                    and os.path.getsize(installed) == item["size"]
+                    and sha256_file(installed) == item["sha256"]):
+                reusable[item["dest"]] = installed
+        except OSError:
+            continue
+    download_total = sum(
+        item["size"] for item in manifest["files"]
+        if item["dest"] not in reusable)
+    margin = max(download_total // 20, 64 * 1024 * 1024)
+    if shutil.disk_usage(client_dir).free < download_total + margin:
         raise RuntimeError("not enough free disk space for OctoWoW HD Switch")
     ensure_dir(APP_DATA_DIR)
-    if shutil.disk_usage(APP_DATA_DIR).free < total + margin:
+    if shutil.disk_usage(APP_DATA_DIR).free < download_total + margin:
         raise RuntimeError("not enough temporary disk space for OctoWoW HD Switch")
     with tempfile.TemporaryDirectory(
             prefix="octowow-hd-", dir=APP_DATA_DIR) as staging:
         replacements = {}
+        sources = {}
         completed = 0
         for index, item in enumerate(manifest["files"]):
+            existing = reusable.get(item["dest"])
+            if existing:
+                log(
+                    f"  Reusing verified {item['dest']} "
+                    f"({fmt_size(item['size'])})...")
+                sources[item["dest"]] = existing
+                completed += item["size"]
+                if on_progress:
+                    on_progress(item["dest"], completed, total)
+                continue
             staged = os.path.join(staging, f"{index:03d}.download")
             log(f"  Downloading {item['dest']} ({fmt_size(item['size'])})...")
+
             def progress(name, done, _file_total, base=completed):
                 if on_progress:
                     on_progress(name, base + done, total)
+
             _download_verified_file(item, staged, on_progress=progress)
             completed += item["size"]
             if item["dest"] == OCTOWOW_HD_DLL:
@@ -3638,11 +3664,12 @@ def install_octowow_hd(
                         f"HDToggle.dll version {embedded} does not match {version}")
             elif item["dest"].lower().endswith(".mpq"):
                 _validate_mpq_file(staged)
+            sources[item["dest"]] = staged
             replacements[item["dest"]] = staged
 
         toc_item = next(item for item in manifest["files"]
                         if item["dest"].endswith("HDSwitch.toc"))
-        toc = read_toc_file(replacements[toc_item["dest"]])
+        toc = read_toc_file(sources[toc_item["dest"]])
         if (toc.get("Interface") != "11200"
                 or _normalized_semver(toc.get("Version")) != version):
             raise RuntimeError("HDSwitch.toc metadata does not match the release")
@@ -3656,8 +3683,9 @@ def install_octowow_hd(
         ]
         for relative in addon_files:
             shutil.copyfile(
-                replacements.pop(relative),
+                sources[relative],
                 os.path.join(addon_staged, Path(relative).name))
+            replacements.pop(relative, None)
         replacements["Interface/AddOns/HDSwitch"] = addon_staged
 
         dlls = _hdtoggle_dlls_bytes(client_dir, enabled=True)

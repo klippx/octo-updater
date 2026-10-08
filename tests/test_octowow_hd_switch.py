@@ -361,9 +361,11 @@ class OctoWowTransactionTests(unittest.TestCase):
                                "name": updater.OCTOWOW_HD_MANIFEST}],
                    "hd_manifest": manifest}
         (self.client / "dlls.txt").write_text("ClassicAPI.dll\n")
+        requested = []
 
         def response(request, **_kwargs):
             url = request.full_url
+            requested.append(url)
             item = next(item for item in manifest["files"]
                         if item["url"] == url)
             return io.BytesIO(payloads[item["dest"]])
@@ -381,15 +383,24 @@ class OctoWowTransactionTests(unittest.TestCase):
             files, version, _fingerprint = updater.install_octowow_hd(
                 str(self.client), release)
             updater.uninstall_octowow_hd(str(self.client))
+            updater.install_octowow_hd(str(self.client), release)
 
         self.assertEqual(version, "1.2.6")
         self.assertEqual(len(files), 21)
-        self.assertFalse((self.client / "HDToggle.dll").exists())
-        self.assertFalse(
-            (self.client / "Interface" / "AddOns" / "HDSwitch").exists())
+        self.assertTrue((self.client / "HDToggle.dll").exists())
+        self.assertTrue(
+            (self.client / "Interface" / "AddOns" / "HDSwitch"
+             / "PackRefs.lua").exists())
         self.assertTrue((self.client / "Data" / "Patch-X.mpq").exists())
+        mpq_urls = {
+            item["url"] for item in manifest["files"]
+            if item["dest"].lower().endswith(".mpq")
+        }
+        self.assertTrue(mpq_urls)
+        self.assertTrue(all(requested.count(url) == 1 for url in mpq_urls))
         self.assertEqual(
-            (self.client / "dlls.txt").read_text(), "ClassicAPI.dll\n")
+            (self.client / "dlls.txt").read_text(),
+            "ClassicAPI.dll\nHDToggle.dll\n")
 
     def test_file_set_transaction_rolls_back_all_files(self):
         first = self.client / "first.bin"
