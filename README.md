@@ -43,7 +43,8 @@ Codeberg releases and registered in `dlls.txt`:
   folder when **Install essential mods** is enabled in Settings.
 - Per-mod **update** / **retry** actions and an update-count badge on the tab.
 - When VanillaFixes is installed, **PLAY** launches through it instead of
-  `WoW.exe` directly.
+  `WoW.exe` directly. On native Linux, Octo Updater asks Lutris to launch the
+  selected registered game; verify Lutris uses `VanillaFixes.exe` when needed.
 
 ### Tweaks
 
@@ -114,9 +115,11 @@ verification/updates.
   executable can also run through Proton. With Wine, run the updater and game
   in the same prefix; with Proton, point the updater at the game folder visible
   inside its compatibility environment.
-- Native Linux/macOS source execution supports downloading, updating, and
-  configuring client files. Its **PLAY** button does not launch the Windows
-  game executable; launch the game separately through Wine/Proton.
+- Native Linux source execution supports **PLAY** through an existing
+  [Lutris](https://lutris.net/) Wine-runner game entry. No particular
+  Wine-prefix or game-folder layout is assumed. macOS source execution supports
+  downloading, updating, and configuring client files, but the Windows game
+  must still be launched separately.
 - **Python 3.10+** — only if running from source. Runs on the standard
   library, and will also use [`certifi`](https://pypi.org/project/certifi/) if
   installed, for more robust TLS verification on machines with an out-of-date
@@ -159,8 +162,34 @@ python octo_updater.py
 
 The updater keeps its data in a per-user app-data folder.
 
-Native Linux/macOS source mode can manage the client files, but launch the game
-separately through Wine/Proton instead of using **PLAY**.
+### PLAY on native Linux
+
+Octo Updater automatically asks Lutris for its installed games and accepts every
+entry with a numeric ID and the Wine runner. Lutris does not expose the saved
+executable or Wine prefix in this game list, so Octo Updater does not pretend it
+can identify the correct entry from folder layout. If there is one Wine entry,
+**PLAY** uses it immediately. If there are several, **CHOOSE LAUNCHER** lets you
+select one; that Lutris game ID is saved for the current game folder. Reported
+directories are used only to put likely related entries earlier in the chooser,
+never to exclude an entry.
+
+If no Wine entry is found, **HOW TO PLAY** shows the folder and executable:
+
+1. In Lutris, add a locally installed Windows game.
+2. Retry detection from **HOW TO PLAY** and choose the entry if several are
+   installed.
+3. Set **Game options → Executable** to `VanillaFixes.exe` when
+   present (required to load installed mod DLLs), otherwise `WoW.exe`.
+
+Octo Updater uses Lutris's supported game-list and launch interfaces; it does
+not read Lutris's private database or YAML files, and it does not export or
+inspect Lutris launch scripts. The footer therefore uses neutral, non-blocking
+wording reminding you to verify the configured executable in Lutris.
+
+Steam/Proton, Bottles, plain Wine, desktop launchers, and manual launch remain
+external to Octo Updater. It deliberately does not guess Proton binaries or
+prefixes, and it never executes a user-provided shell command. Flatpak-only
+Lutris installations are not auto-detected in this initial integration.
 
 ---
 
