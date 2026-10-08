@@ -265,6 +265,22 @@ class OctoWowDetectionTests(unittest.TestCase):
             str(self.client), releases=releases)
         self.assertEqual(mixed["health"], "mixed_version")
 
+    def test_client_version_mismatch_is_advisory(self):
+        manifest, payloads = normalized_manifest()
+        release = {"id": 1, "tag_name": "v1.2.5",
+                   "hd_manifest": manifest}
+        self.write_manifest(manifest, payloads)
+
+        with mock.patch.object(
+                updater, "get_client_version",
+                return_value="1.18.1 (7272)"):
+            state = updater.detect_octowow_hd_state(
+                str(self.client), releases=[release])
+
+        self.assertEqual(state["health"], "complete_current")
+        self.assertIsNone(state["error"])
+        self.assertIn("does not enforce", state["compatibility_warning"])
+
 
 class OctoWowTransactionTests(unittest.TestCase):
     def setUp(self):
@@ -301,7 +317,7 @@ class OctoWowTransactionTests(unittest.TestCase):
                 mock.patch.object(updater.shutil, "disk_usage",
                                   return_value=usage), \
                 mock.patch.object(updater, "get_client_version",
-                                  return_value="1.12.1 (5875)"), \
+                                  return_value="1.18.1 (7272)"), \
                 mock.patch.object(updater, "secure_urlopen",
                                   side_effect=response):
             files, version, _fingerprint = updater.install_octowow_hd(

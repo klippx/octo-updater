@@ -67,9 +67,12 @@ Codeberg releases and registered in `dlls.txt`:
   packs. Removing HD Switch follows upstream semantics: it removes the root DLL,
   runtime INI/log, addon, and loader registration while leaving all HD MPQs in
   place.
-- VanillaFixes and WoW 1.12.1 build 5875 are required by HD Switch.
-  File management works on every OctoUpdater host platform; upstream documents
-  macOS/Wine testing and explicitly says Windows runtime testing is pending.
+- VanillaFixes is required by HD Switch. Upstream currently documents WoW
+  1.12.1 build 5875, but OctoUpdater does not enforce a client version: a known
+  mismatch is shown as an advisory warning because compatibility can change
+  independently with OctoWoW and HD Switch releases. File management works on
+  every OctoUpdater host platform; upstream documents macOS/Wine testing and
+  explicitly says Windows runtime testing is pending.
 - When VanillaFixes is installed, **PLAY** launches through it instead of
   `WoW.exe` directly. On native Linux, Octo Updater asks Lutris to launch the
   selected registered game; verify Lutris uses `VanillaFixes.exe` when needed.

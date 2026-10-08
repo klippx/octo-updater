@@ -2707,8 +2707,10 @@ def mod_description(mod: dict, platform: str | None = None) -> str:
         description += octologin_platform_note(platform)
     elif mod["id"] == OCTOWOW_HD_ID:
         description += (
-            " Requires VanillaFixes and WoW 1.12.1 build 5875; upstream "
-            "documents macOS/Wine testing and says Windows is not yet tested."
+            " Requires VanillaFixes. Upstream currently documents client "
+            "1.12.1 build 5875, but OctoUpdater treats client versions as "
+            "advisory; upstream documents macOS/Wine testing and says Windows "
+            "is not yet tested."
         )
     return description
 
@@ -3164,6 +3166,7 @@ def detect_octowow_hd_state(
                 "health": "recovery_required",
                 "status": "broken",
                 "error": "An interrupted HD Switch transaction must be recovered",
+                "compatibility_warning": None,
             }
     try:
         stats, hashes = _octowow_hd_file_hashes(client_dir, saved_state)
@@ -3179,6 +3182,7 @@ def detect_octowow_hd_state(
             "health": "corrupt",
             "status": "broken",
             "error": str(error),
+            "compatibility_warning": None,
         }
     present = sorted(hashes)
     core_present = any(path in hashes for path in (
@@ -3203,6 +3207,7 @@ def detect_octowow_hd_state(
             "health": "absent",
             "status": "not_installed",
             "error": None,
+            "compatibility_warning": None,
         }
 
     invalid = []
@@ -3286,11 +3291,6 @@ def detect_octowow_hd_state(
     elif not vf_ready:
         health = "dependency_blocked"
         error = "VanillaFixes is required to load HDToggle.dll"
-    elif client_version and client_version != "1.12.1 (5875)":
-        health = "dependency_blocked"
-        error = (
-            "OctoWoW HD Switch requires WoW 1.12.1 build 5875 "
-            f"(found {client_version})")
     elif matched_version:
         latest = ((releases[0].get("hd_manifest") or {}).get("release")
                   if releases else None)
@@ -3303,6 +3303,12 @@ def detect_octowow_hd_state(
     else:
         health = "manual_unknown"
         error = None
+    compatibility_warning = None
+    if client_version and client_version != "1.12.1 (5875)":
+        compatibility_warning = (
+            f"Detected client {client_version}. Upstream documentation names "
+            "1.12.1 build 5875, but OctoUpdater does not enforce a client "
+            "version for HD Switch.")
 
     return {
         **saved_state,
@@ -3320,6 +3326,7 @@ def detect_octowow_hd_state(
                    "installed_unknown" if health == "manual_unknown" else
                    "broken"),
         "error": error,
+        "compatibility_warning": compatibility_warning,
     }
 
 
@@ -3547,10 +3554,11 @@ def install_octowow_hd(
                for name in ("VanillaFixes.exe", "VfPatcher.dll")):
         raise RuntimeError("VanillaFixes must be installed before HD Switch")
     client_version = get_client_version(client_dir)
-    if client_version != "1.12.1 (5875)":
-        raise RuntimeError(
-            "HD Switch requires WoW 1.12.1 build 5875 "
-            f"(found {client_version or 'an unknown build'})")
+    if client_version and client_version != "1.12.1 (5875)":
+        log(
+            f"  Warning: detected client {client_version}; upstream "
+            "documentation names 1.12.1 build 5875, but installation will "
+            "continue.")
     manifest = release.get("hd_manifest") or _fetch_octowow_hd_manifest(release)
     version = manifest["release"]
     total = manifest["total_size"]
@@ -6089,6 +6097,7 @@ class OctoUpdaterApp(tk.Tk):
                         refs["ignore"].set(state.get("ignore_updates", False))
 
                 has_error = bool(state.get("error"))
+                compatibility_warning = state.get("compatibility_warning")
                 installed = mod_state_installed(state)
                 if "name_label" in refs:
                     refs["name_label"].configure(
@@ -6098,7 +6107,12 @@ class OctoUpdaterApp(tk.Tk):
                         fg=C_TEXT if state.get("enabled", False) else C_TEXT_DIM)
                 if "error_label" in refs:
                     if has_error:
-                        refs["error_label"].configure(text=f"  \u26a0  {state['error']}")
+                        refs["error_label"].configure(
+                            text=f"  \u26a0  {state['error']}", fg=C_ERR)
+                        refs["error_label"].pack(fill="x", pady=(0, self._px(4)))
+                    elif compatibility_warning:
+                        refs["error_label"].configure(
+                            text=f"  \u26a0  {compatibility_warning}", fg=C_GOLD)
                         refs["error_label"].pack(fill="x", pady=(0, self._px(4)))
                     else:
                         refs["error_label"].pack_forget()
@@ -6205,12 +6219,17 @@ class OctoUpdaterApp(tk.Tk):
             desc_label.pack(side="left", fill="x", expand=True)
 
             existing_err = state.get("error")
+            compatibility_warning = state.get("compatibility_warning")
             error_label = tk.Label(container, text="",
                                    font=("Segoe UI", 9), fg=C_ERR,
                                    bg=C_PANEL, anchor="w", padx=self._px(16))
             if existing_err:
                 name_label.configure(fg=C_ERR)
                 error_label.configure(text=f"  \u26a0  {existing_err}")
+                error_label.pack(fill="x", pady=(0, self._px(4)))
+            elif compatibility_warning:
+                error_label.configure(
+                    text=f"  \u26a0  {compatibility_warning}", fg=C_GOLD)
                 error_label.pack(fill="x", pady=(0, self._px(4)))
 
             divider = tk.Frame(self._mods_inner, bg=C_DIVIDER, height=self._px(1))
