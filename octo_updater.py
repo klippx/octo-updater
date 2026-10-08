@@ -324,76 +324,73 @@ def _lutris_directory_score(candidate: str, wanted: str) -> tuple[int, int] | No
     return common_depth, -distance
 
 
-def matching_lutris_games(raw_json: str, client_dir: str,
+def eligible_lutris_games(raw_json: str, client_dir: str,
                           diagnostics: list[str] | None = None) -> list[dict]:
-    """Return the Wine entries with the strongest directory-path similarity."""
+    """Return all launchable Wine entries, ordered by directory similarity."""
     games = json.loads(raw_json)
     if not isinstance(games, list):
         raise ValueError("Lutris returned JSON that is not a game list")
 
     wanted = _normalized_real_path(client_dir)
-    scored_matches = []
-    rejections = []
+    eligible = []
+    candidate_diagnostics = []
     for game in games:
         label = _lutris_candidate_label(game)
         if not isinstance(game, dict):
-            rejections.append(f"{label}: rejected (entry is not an object)")
+            candidate_diagnostics.append(
+                f"{label}: rejected (entry is not an object)")
             continue
         game_id = str(game.get("id", ""))
         if not game_id.isdecimal():
-            rejections.append(f"{label}: rejected (ID is not numeric)")
+            candidate_diagnostics.append(
+                f"{label}: rejected (ID is not numeric)")
             continue
         if game.get("runner") != "wine":
-            rejections.append(f"{label}: rejected (runner is not literal 'wine')")
+            candidate_diagnostics.append(
+                f"{label}: rejected (runner is not literal 'wine')")
             continue
         directory = game.get("directory")
-        if not isinstance(directory, str) or not directory.strip():
-            rejections.append(f"{label}: rejected (directory is missing or invalid)")
-            continue
-        candidate = _normalized_real_path(directory)
         match = {
             "id": game_id,
             "name": str(game.get("name") or f"Lutris game {game_id}"),
             "runner": "wine",
-            "directory": directory,
+            "directory": (
+                directory
+                if isinstance(directory, str) and directory.strip()
+                else None
+            ),
         }
-        score = _lutris_directory_score(candidate, wanted)
-        if score is None:
-            rejections.append(
-                f"{label}: rejected (no shared directory beyond filesystem "
-                f"root: "
-                f"target={wanted!r}, "
-                f"candidate={candidate!r})")
-            continue
-        scored_matches.append((score, candidate, match, label))
-
-    best_score = max(
-        (score for score, _, _, _ in scored_matches),
-        default=None,
-    )
-    matches = [
-        match for score, _, match, _ in scored_matches
-        if score == best_score
-    ]
-    closest_ids = {match["id"] for match in matches}
-    for score, candidate, match, label in scored_matches:
-        common_depth, negative_distance = score
-        if match["id"] in closest_ids:
-            rejections.append(
-                f"{label}: accepted as closest shared directory path "
-                f"(common depth={common_depth}, distance={-negative_distance}, "
-                f"target={wanted!r}, candidate={candidate!r})")
+        score = None
+        if match["directory"] is not None:
+            candidate = _normalized_real_path(match["directory"])
+            score = _lutris_directory_score(candidate, wanted)
+        eligible.append((score, match))
+        if match["directory"] is None:
+            reason = "directory unavailable; included for manual choice"
+        elif score is None:
+            reason = "no shared path beyond filesystem root; included for manual choice"
         else:
-            rejections.append(
-                f"{label}: rejected (another Wine entry has a closer shared "
-                f"directory path to target={wanted!r}; "
-                f"candidate={candidate!r})")
+            reason = (
+                f"directory score common-depth={score[0]}, "
+                f"distance={-score[1]}; included"
+            )
+        candidate_diagnostics.append(f"{label}: {reason}")
+
+    eligible.sort(
+        key=lambda item: (
+            item[0] is not None,
+            item[0] if item[0] is not None else (0, 0),
+        ),
+        reverse=True,
+    )
+    matches = [match for _, match in eligible]
     if diagnostics is not None:
-        diagnostics.extend(rejections[:LUTRIS_LOG_REJECTION_LIMIT])
-        if len(rejections) > LUTRIS_LOG_REJECTION_LIMIT:
+        diagnostics.extend(
+            candidate_diagnostics[:LUTRIS_LOG_REJECTION_LIMIT])
+        if len(candidate_diagnostics) > LUTRIS_LOG_REJECTION_LIMIT:
             diagnostics.append(
-                f"{len(rejections) - LUTRIS_LOG_REJECTION_LIMIT} additional "
-                "rejected entries omitted")
+                f"{len(candidate_diagnostics) - LUTRIS_LOG_REJECTION_LIMIT} "
+                "additional entries omitted")
     return matches
 
 
@@ -404,7 +401,7 @@ def lutris_launch_command(lutris: str, game_id: str) -> list[str]:
 
 
 def discover_lutris_games(client_dir: str) -> dict:
-    """Discover Wine-runner directory matches through Lutris's supported CLI."""
+    """Discover launchable Wine entries through Lutris's supported CLI."""
     normalized = _normalized_real_path(client_dir)
     lutris = shutil.which("lutris")
     if not lutris:
@@ -425,22 +422,21 @@ def discover_lutris_games(client_dir: str) -> dict:
                 f"{result.returncode}{f': {detail}' if detail else '.'}", "err")
             raise RuntimeError(message)
         diagnostics = []
-        matches = matching_lutris_games(
+        matches = eligible_lutris_games(
             result.stdout, client_dir, diagnostics)
         if len(matches) == 1:
             game = matches[0]
-            log(f'[Lutris] Matched "{game["name"]}" (ID {game["id"]}) '
-                "by closest shared directory path.", "ok")
+            log(f'[Lutris] Found one Wine entry: "{game["name"]}" '
+                f'(ID {game["id"]}).', "ok")
         elif len(matches) > 1:
-            log(f"[Lutris] Found {len(matches)} matching entries; "
+            log(f"[Lutris] Found {len(matches)} installed Wine entries; "
                 "choose which one PLAY should use.", "acct")
+            for detail in diagnostics:
+                log(f"[Lutris] {detail}", "dim")
         else:
-            detail = (
-                f" Candidate check: {_bounded_log_detail(diagnostics[0])}."
-                if diagnostics else ""
-            )
-            log(f"[Lutris] No matching Wine entry for {normalized}.{detail}",
-                "dim")
+            log(f"[Lutris] No installed Wine entry for {normalized}.", "dim")
+            for detail in diagnostics:
+                log(f"[Lutris] {detail}", "dim")
         return {"status": "ready", "matches": matches, "lutris": lutris}
     except subprocess.TimeoutExpired:
         error = f"Lutris discovery timed out after {LUTRIS_TIMEOUT}s"
@@ -6692,7 +6688,7 @@ class OctoUpdaterApp(tk.Tk):
             self._status_var.set("Lutris check failed")
         else:
             self._set_btn_action("launch_help", "HOW TO PLAY")
-            self._status_var.set("Add game folder to Lutris")
+            self._status_var.set("Add a Wine game to Lutris")
 
     def _refresh_ready_state(self):
         """Recompute the footer status/button after an operation finishes.
@@ -6745,8 +6741,8 @@ class OctoUpdaterApp(tk.Tk):
         win.transient(self)
         choice = tk.StringVar(value=matches[0]["id"])
         tk.Label(
-            win, text="Multiple Lutris entries use this game folder.\n"
-            "Choose the entry PLAY should launch:",
+            win, text="Choose the Lutris Wine entry PLAY should launch.\n"
+            "This selection is saved for the current game folder:",
             font=("Segoe UI", 10), fg=C_TEXT, bg=C_PANEL,
             justify="left").pack(anchor="w", padx=self._px(18),
                                  pady=(self._px(16), self._px(8)))
@@ -6793,8 +6789,8 @@ class OctoUpdaterApp(tk.Tk):
             return
         retry = messagebox.askretrycancel(
             "Launching the game",
-            "Octo Updater can use the Wine-runner Lutris entry whose reported "
-            "directory has the closest shared path with this game folder:\n\n"
+            "Octo Updater can launch an installed Wine-runner Lutris entry "
+            "for this game folder:\n\n"
             f"{client_dir}\n\n"
             "Separately, verify Lutris is configured to launch "
             f"{exe_lbl}. VanillaFixes.exe is required to load "
@@ -6812,7 +6808,7 @@ class OctoUpdaterApp(tk.Tk):
         client_dir = self._game_path.get().strip()
         _, exe_lbl = selected_game_executable(client_dir, load_config())
         selected = self._lutris_state.get("selected") or {}
-        game_label = selected.get("name") or "the matched Lutris entry"
+        game_label = selected.get("name") or "the selected Lutris entry"
         messagebox.showinfo(
             "Verify Lutris executable",
             f"PLAY will launch {game_label} through Lutris.\n\n"
@@ -6826,7 +6822,7 @@ class OctoUpdaterApp(tk.Tk):
             parent=self)
 
     def _launch_game(self):
-        """Launch through the native Windows path or a matched Lutris entry.
+        """Launch through the native Windows path or a selected Lutris entry.
         If VanillaFixes is installed use VanillaFixes.exe (it injects dlls then
         starts WoW.exe itself). Otherwise fall back to WoW.exe directly."""
         import subprocess
