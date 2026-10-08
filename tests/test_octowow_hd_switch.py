@@ -197,6 +197,32 @@ class OctoWowReleaseTests(unittest.TestCase):
                 "latest_sha256": "b" * 64,
             }))
 
+    def test_accepts_new_managed_addon_files(self):
+        release, manifest, _manifest_data = api_release_and_manifest("1.2.6")
+        data = b"local PACKS = {}"
+        item = {
+            "asset": "HDSwitch-PackRefs.lua",
+            "dest": "Interface/AddOns/HDSwitch/PackRefs.lua",
+            "size": len(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
+        }
+        manifest["components"][0]["files"].append(item)
+        release["assets"].append({
+            "id": 1000,
+            "name": item["asset"],
+            "size": item["size"],
+            "content_type": "application/octet-stream",
+            "digest": f"sha256:{item['sha256']}",
+            "browser_download_url":
+                "https://github.com/example/release/HDSwitch-PackRefs.lua",
+        })
+
+        parsed = updater._validated_octowow_hd_manifest(release, manifest)
+
+        self.assertIn(
+            "Interface/AddOns/HDSwitch/PackRefs.lua",
+            [file["dest"] for file in parsed["files"]])
+
 
 class OctoWowDetectionTests(unittest.TestCase):
     def setUp(self):
@@ -281,6 +307,23 @@ class OctoWowDetectionTests(unittest.TestCase):
         self.assertIsNone(state["error"])
         self.assertIn("does not enforce", state["compatibility_warning"])
 
+    def test_preserves_hash_verified_version_without_release_history(self):
+        manifest, payloads = normalized_manifest()
+        release = {"id": 1, "tag_name": "v1.2.5",
+                   "hd_manifest": manifest}
+        self.write_manifest(manifest, payloads)
+        detected = updater.detect_octowow_hd_state(
+            str(self.client), releases=[release])
+
+        restarted = updater.detect_octowow_hd_state(
+            str(self.client), saved_state=detected, releases=[])
+
+        self.assertEqual(restarted["health"], "complete_current")
+        self.assertEqual(restarted["status"], "installed")
+        self.assertEqual(restarted["installed_version"], "1.2.5")
+        self.assertEqual(
+            updater.mod_display_version(restarted, None), "1.2.5")
+
 
 class OctoWowTransactionTests(unittest.TestCase):
     def setUp(self):
@@ -297,8 +340,23 @@ class OctoWowTransactionTests(unittest.TestCase):
         self.tempdir.cleanup()
 
     def test_install_and_remove_preserve_packs_and_unrelated_registration(self):
-        manifest, payloads = normalized_manifest()
-        release = {"id": 1, "tag_name": "v1.2.5",
+        def add_pack_refs(files, payloads):
+            relative = "Interface/AddOns/HDSwitch/PackRefs.lua"
+            data = b"local PACKS = {}"
+            payloads[relative] = data
+            files.append({
+                "component": "hdswitch",
+                "asset": "HDSwitch-PackRefs.lua",
+                "asset_id": 1000,
+                "dest": relative,
+                "size": len(data),
+                "sha256": hashlib.sha256(data).hexdigest(),
+                "url":
+                    "https://github.com/example/release/HDSwitch-PackRefs.lua",
+            })
+
+        manifest, payloads = normalized_manifest("1.2.6", add_pack_refs)
+        release = {"id": 1, "tag_name": "v1.2.6",
                    "assets": [{"id": 999,
                                "name": updater.OCTOWOW_HD_MANIFEST}],
                    "hd_manifest": manifest}
@@ -324,8 +382,8 @@ class OctoWowTransactionTests(unittest.TestCase):
                 str(self.client), release)
             updater.uninstall_octowow_hd(str(self.client))
 
-        self.assertEqual(version, "1.2.5")
-        self.assertEqual(len(files), 20)
+        self.assertEqual(version, "1.2.6")
+        self.assertEqual(len(files), 21)
         self.assertFalse((self.client / "HDToggle.dll").exists())
         self.assertFalse(
             (self.client / "Interface" / "AddOns" / "HDSwitch").exists())

@@ -2905,6 +2905,7 @@ def _validated_octowow_hd_manifest(rel: dict, manifest: dict) -> dict:
 
     expected = {path.replace("\\", "/").lower()
                 for path in OCTOWOW_HD_REQUIRED_FILES}
+    addon_prefix = f"Interface/AddOns/{OCTOWOW_HD_ADDON}/"
     normalized = []
     seen = set()
     for component_id in required_components:
@@ -2926,7 +2927,12 @@ def _validated_octowow_hd_manifest(rel: dict, manifest: dict) -> dict:
             dest_key = dest.lower()
             if dest_key in seen:
                 raise RuntimeError(f"duplicate HD Switch destination: {dest}")
-            if dest_key not in expected:
+            managed_addon_file = (
+                component_id == "hdswitch"
+                and dest.startswith(addon_prefix)
+                and len(dest.split("/")) == 4
+                and Path(dest).suffix.lower() in (".lua", ".toc", ".xml"))
+            if dest_key not in expected and not managed_addon_file:
                 continue
             seen.add(dest_key)
             size = item.get("size")
@@ -2980,7 +2986,7 @@ def _validated_octowow_hd_manifest(rel: dict, manifest: dict) -> dict:
                 "sha256": digest.lower(),
                 "url": url,
             })
-    if seen != expected:
+    if not expected.issubset(seen):
         missing = sorted(expected - seen)
         raise RuntimeError(
             "HD Switch manifest is missing required files: " + ", ".join(missing))
@@ -3120,13 +3126,33 @@ def hdtoggle_pe_version(data: bytes) -> str | None:
     return None
 
 
+def _octowow_hd_managed_files(
+        saved_state: dict | None = None,
+        releases: list[dict] | None = None) -> tuple[str, ...]:
+    files = set(OCTOWOW_HD_REQUIRED_FILES)
+    addon_prefix = f"Interface/AddOns/{OCTOWOW_HD_ADDON}/"
+    for relative in (saved_state or {}).get("installed_files", []):
+        if (relative in OCTOWOW_HD_REQUIRED_FILES
+                or (isinstance(relative, str)
+                    and relative.startswith(addon_prefix)
+                    and len(relative.split("/")) == 4)):
+            files.add(relative)
+    for release in releases or []:
+        for item in (release.get("hd_manifest") or {}).get("files", []):
+            relative = item.get("dest")
+            if isinstance(relative, str):
+                files.add(relative)
+    return tuple(sorted(files, key=str.casefold))
+
+
 def _octowow_hd_file_hashes(
-        client_dir: str, saved_state: dict | None = None) -> tuple[dict, dict]:
+        client_dir: str, saved_state: dict | None = None,
+        releases: list[dict] | None = None) -> tuple[dict, dict]:
     saved_state = saved_state or {}
     old_stats = saved_state.get("file_stats") or {}
     old_hashes = saved_state.get("file_hashes") or {}
     stats, hashes = {}, {}
-    for relative in OCTOWOW_HD_REQUIRED_FILES:
+    for relative in _octowow_hd_managed_files(saved_state, releases):
         path = _transaction_client_path(client_dir, relative)
         if not os.path.isfile(path) or os.path.islink(path):
             continue
@@ -3169,7 +3195,8 @@ def detect_octowow_hd_state(
                 "compatibility_warning": None,
             }
     try:
-        stats, hashes = _octowow_hd_file_hashes(client_dir, saved_state)
+        stats, hashes = _octowow_hd_file_hashes(
+            client_dir, saved_state, releases)
     except RuntimeError as error:
         return {
             **saved_state,
@@ -3185,8 +3212,10 @@ def detect_octowow_hd_state(
             "compatibility_warning": None,
         }
     present = sorted(hashes)
-    core_present = any(path in hashes for path in (
-        OCTOWOW_HD_DLL, *OCTOWOW_HD_ADDON_FILES))
+    addon_prefix = f"Interface/AddOns/{OCTOWOW_HD_ADDON}/"
+    core_present = (
+        OCTOWOW_HD_DLL in hashes
+        or any(path.startswith(addon_prefix) for path in hashes))
     try:
         canonical_registration, any_registration = \
             _hdtoggle_registration(client_dir)
@@ -3212,7 +3241,8 @@ def detect_octowow_hd_state(
 
     invalid = []
     metadata_versions = set()
-    for relative in OCTOWOW_HD_REQUIRED_FILES:
+    managed_files = _octowow_hd_managed_files(saved_state, releases)
+    for relative in managed_files:
         path = os.path.join(client_dir, *relative.split("/"))
         if os.path.lexists(path) and os.path.islink(path):
             invalid.append(relative + " (symlink)")
@@ -3245,20 +3275,21 @@ def detect_octowow_hd_state(
 
     matching_versions = []
     matching_fingerprints = {}
-    file_versions = {relative: set()
-                     for relative in OCTOWOW_HD_REQUIRED_FILES}
+    file_versions = {relative: set() for relative in managed_files}
+    manifests_by_version = {}
     for release in releases:
         manifest = release.get("hd_manifest") or {}
         version = manifest.get("release")
         files = manifest.get("files") or []
         if not version or not files:
             continue
+        manifests_by_version[version] = manifest
         matched = set()
         for item in files:
             if hashes.get(item["dest"]) == item["sha256"]:
                 matched.add(item["dest"])
-                file_versions[item["dest"]].add(version)
-        if len(matched) == len(OCTOWOW_HD_REQUIRED_FILES):
+                file_versions.setdefault(item["dest"], set()).add(version)
+        if len(matched) == len(files):
             matching_versions.append(version)
             matching_fingerprints[version] = \
                 _octowow_hd_fingerprint(files)
@@ -3266,10 +3297,28 @@ def detect_octowow_hd_state(
     matched_version = matching_versions[0] if matching_versions else None
     metadata_version = (
         next(iter(metadata_versions)) if len(metadata_versions) == 1 else None)
-    missing = sorted(set(OCTOWOW_HD_REQUIRED_FILES) - set(present))
+    saved_version = _normalized_semver(saved_state.get("installed_version"))
+    target_version = matched_version or metadata_version or saved_version
+    target_manifest = manifests_by_version.get(target_version)
+    if target_manifest is None and releases:
+        target_manifest = releases[0].get("hd_manifest") or None
+    target_files = {
+        item["dest"] for item in (target_manifest or {}).get("files", [])
+    } or set(OCTOWOW_HD_REQUIRED_FILES)
+    missing = sorted(target_files - set(present))
     current_fingerprint = None
-    if not missing:
-        current_fingerprint = _octowow_hd_fingerprint(hashes)
+    fingerprint_files = (
+        set(saved_state.get("installed_files") or [])
+        if saved_state.get("installed_sha256") else target_files)
+    if fingerprint_files and fingerprint_files.issubset(hashes):
+        current_fingerprint = _octowow_hd_fingerprint(
+            {path: hashes[path] for path in fingerprint_files})
+    recorded_version = None
+    if (saved_version and current_fingerprint
+            and current_fingerprint == saved_state.get("installed_sha256")):
+        recorded_version = saved_version
+        if target_version == saved_version and target_manifest is not None:
+            missing = sorted(target_files - set(present))
 
     vf_ready = all(os.path.exists(os.path.join(client_dir, name))
                    for name in ("VanillaFixes.exe", "VfPatcher.dll"))
@@ -3277,9 +3326,6 @@ def detect_octowow_hd_state(
     if invalid:
         health = "corrupt"
         error = "Invalid HD Switch files: " + ", ".join(invalid)
-    elif missing:
-        health = "partial"
-        error = f"HD Switch is missing {len(missing)} required file(s)"
     elif len(metadata_versions) > 1:
         health = "mixed_version"
         error = "HDToggle.dll and HDSwitch.toc versions disagree"
@@ -3291,13 +3337,18 @@ def detect_octowow_hd_state(
     elif not vf_ready:
         health = "dependency_blocked"
         error = "VanillaFixes is required to load HDToggle.dll"
-    elif matched_version:
+    elif matched_version or (recorded_version and not missing):
         latest = ((releases[0].get("hd_manifest") or {}).get("release")
                   if releases else None)
-        health = ("complete_current" if matched_version == latest
+        installed_version = matched_version or recorded_version
+        health = ("complete_current" if latest is None
+                  or installed_version == latest
                   else "complete_outdated")
         error = None
-    elif all(file_versions.values()):
+    elif missing:
+        health = "partial"
+        error = f"HD Switch is missing {len(missing)} required file(s)"
+    elif target_files and all(file_versions.get(path) for path in target_files):
         health = "mixed_version"
         error = "HD Switch components come from different releases"
     else:
@@ -3313,7 +3364,7 @@ def detect_octowow_hd_state(
     return {
         **saved_state,
         "enabled": True,
-        "installed_version": matched_version or metadata_version,
+        "installed_version": matched_version or recorded_version or metadata_version,
         "installed_sha256": (
             matching_fingerprints.get(matched_version)
             or current_fingerprint),
@@ -3598,7 +3649,12 @@ def install_octowow_hd(
 
         addon_staged = os.path.join(staging, OCTOWOW_HD_ADDON)
         os.makedirs(addon_staged)
-        for relative in OCTOWOW_HD_ADDON_FILES:
+        addon_prefix = f"Interface/AddOns/{OCTOWOW_HD_ADDON}/"
+        addon_files = [
+            item["dest"] for item in manifest["files"]
+            if item["dest"].startswith(addon_prefix)
+        ]
+        for relative in addon_files:
             shutil.copyfile(
                 replacements.pop(relative),
                 os.path.join(addon_staged, Path(relative).name))
@@ -3626,7 +3682,7 @@ def install_octowow_hd(
             raise
         tx.commit()
     fingerprint = _octowow_hd_fingerprint(manifest["files"])
-    return list(OCTOWOW_HD_REQUIRED_FILES), version, fingerprint
+    return [item["dest"] for item in manifest["files"]], version, fingerprint
 
 
 def uninstall_octowow_hd(client_dir: str):
@@ -3975,7 +4031,8 @@ def mod_state_installed(state: dict) -> bool:
 
 
 def mod_display_version(state: dict, live: dict | None) -> str:
-    if state.get("status") == "installed_unknown":
+    if (state.get("status") == "installed_unknown"
+            and not state.get("installed_version")):
         return "unknown"
     return (state.get("installed_version")
             or (live or {}).get("latest_version")
