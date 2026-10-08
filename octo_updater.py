@@ -91,6 +91,41 @@ APP_DATA_DIR = _default_app_data_dir()
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "config.json")
 VERIFY_TRANSACTION_POINTER = os.path.join(
     APP_DATA_DIR, "active-verify-transaction.json")
+PACKAGE_TRANSACTION_POINTER = os.path.join(
+    APP_DATA_DIR, "active-package-transaction.json")
+
+OCTOWOW_HD_ID = "OctoWoW-HD-Switch"
+OCTOWOW_HD_DLL = "HDToggle.dll"
+OCTOWOW_HD_ADDON = "HDSwitch"
+OCTOWOW_HD_REPO = ("fmustafayaman", "OctoWoW-HD-Switch")
+OCTOWOW_HD_MANIFEST = "manifest-v2.json"
+OCTOWOW_HD_MAX_MANIFEST_BYTES = 256 * 1024
+OCTOWOW_HD_THIRD_PARTY_HOST = \
+    "pub-0f05631d243e4046993fc02ca7be9542.r2.dev"
+OCTOWOW_HD_REQUIRED_MPQS = (
+    "Data/patch-A.mpq", "Data/patch-B.mpq", "Data/patch-C.mpq",
+    "Data/patch-D.mpq", "Data/patch-E.mpq", "Data/Patch-F.mpq",
+    "Data/patch-G.mpq", "Data/Patch-H.mpq", "Data/patch-I.mpq",
+    "Data/patch-M.mpq", "Data/patch-O.mpq", "Data/patch-P.mpq",
+    "Data/patch-S.mpq", "Data/patch-T.mpq", "Data/Patch-X.mpq",
+    "Data/patch-Z.mpq",
+)
+OCTOWOW_HD_THIRD_PARTY_MPQS = frozenset({
+    "Data/patch-A.mpq", "Data/patch-B.mpq", "Data/patch-C.mpq",
+    "Data/patch-D.mpq", "Data/patch-E.mpq", "Data/patch-G.mpq",
+    "Data/patch-I.mpq", "Data/patch-M.mpq", "Data/patch-P.mpq",
+    "Data/patch-S.mpq", "Data/patch-T.mpq",
+})
+OCTOWOW_HD_ADDON_FILES = (
+    "Interface/AddOns/HDSwitch/HDSwitch.toc",
+    "Interface/AddOns/HDSwitch/HDSwitch.lua",
+    "Interface/AddOns/HDSwitch/Bindings.xml",
+)
+OCTOWOW_HD_REQUIRED_FILES = (
+    OCTOWOW_HD_DLL,
+    *OCTOWOW_HD_ADDON_FILES,
+    *OCTOWOW_HD_REQUIRED_MPQS,
+)
 
 # First-run default game folder, anchored to the app dir (not the CWD).
 DEFAULT_GAME_DIR = os.path.join(APP_DIR, "OctoWoW")
@@ -700,23 +735,30 @@ def torrent_version(raw: bytes) -> str:
 
 
 @cache
-def _torrent_excluded_files() -> frozenset:
-    """Lower-cased basenames of every file the Mods tab installs, across all
-    mods — the client-root files the torrent sync leaves to the mod system.
+def _torrent_excluded_paths() -> frozenset:
+    """Lower-cased relative paths owned by the Mods tab.
 
     The torrent ships several of them (VfPatcher.dll, nampower.dll, d3d9.dll,
-    …), but the Mods tab is the single source of truth for installing /
-    disabling / versioning them, so the sync must never fetch, re-add, or flag
-    them. Computed once and memoized (MODS_REGISTRY is static at import)."""
+    …). Composite packages can also own Data and AddOns paths. The sync must
+    never fetch, re-add, or flag any of them."""
     return frozenset(
-        os.path.basename(f).lower()
+        f.replace("\\", "/").strip("/").lower()
         for mod in MODS_REGISTRY
         for f in mod.get("installed_files", [])
     )
 
 
+@cache
+def _torrent_excluded_files() -> frozenset:
+    """Backward-compatible root basenames used by older callers/tests."""
+    return frozenset(
+        path for path in _torrent_excluded_paths() if "/" not in path
+    )
+
+
 def _is_torrent_excluded(parts) -> bool:
-    return len(parts) == 1 and parts[0].lower() in _torrent_excluded_files()
+    relative = "/".join(parts).replace("\\", "/").strip("/").lower()
+    return relative in _torrent_excluded_paths()
 
 
 def _torrent_skip(parts, ignore_speech: bool, client_dir: str) -> bool:
@@ -1089,6 +1131,8 @@ def prune_stale_client_files(client_dir: str, files) -> list:
                     pass
             continue
         if not lc.endswith(".mpq") or lc in expected:
+            continue
+        if package_owned_mpq(name):
             continue
         try:
             size = os.path.getsize(full)
@@ -1949,6 +1993,29 @@ MODS_REGISTRY = [
         "transaction_hook": "octologin",
     },
     {
+        "id":          OCTOWOW_HD_ID,
+        "essential": False,
+        "name":        "OctoWoW HD Switch",
+        "description": (
+            "Installs the HD toggle DLL, addon, and 16 required HD packs "
+            "as one managed package (about 9.44 GiB)."
+        ),
+        "repo_url":    "https://github.com/fmustafayaman/OctoWoW-HD-Switch",
+        "source": {
+            "kind":          "github_release",
+            "owner":         OCTOWOW_HD_REPO[0],
+            "repo":          OCTOWOW_HD_REPO[1],
+            "asset_pattern": OCTOWOW_HD_MANIFEST,
+            "prefer_no":     None,
+            "extract_map":   None,
+        },
+        "register_dll":    OCTOWOW_HD_DLL,
+        "installed_files": list(OCTOWOW_HD_REQUIRED_FILES),
+        "related_files":   ["HDToggle.ini", "HDToggle.log"],
+        "detect_hook":      "octowow_hd",
+        "transaction_hook": "octowow_hd",
+    },
+    {
         "id":          "ClassicAPI",
         "essential": True,
         "name":        "ClassicAPI",
@@ -2570,6 +2637,7 @@ def detect_octologin_state(client_dir: str, saved_state: dict | None = None,
             "enabled": False,
             "installed_version": None,
             "installed_sha256": None,
+            "installed_sha256": None,
             "installed_files": [],
             "detection_source": None,
             "status": "not_installed",
@@ -2637,6 +2705,11 @@ def mod_description(mod: dict, platform: str | None = None) -> str:
     description = mod["description"]
     if mod["id"] == OCTOLOGIN_ID:
         description += octologin_platform_note(platform)
+    elif mod["id"] == OCTOWOW_HD_ID:
+        description += (
+            " Requires VanillaFixes and WoW 1.12.1 build 5875; upstream "
+            "documents macOS/Wine testing and says Windows is not yet tested."
+        )
     return description
 
 
@@ -2800,7 +2873,781 @@ def uninstall_octologin(client_dir: str):
             os.remove(dlls_tmp)
 
 
-def install_mod(mod: dict, client_dir: str, release: dict | None = None) -> list:
+def _validated_octowow_hd_manifest(rel: dict, manifest: dict) -> dict:
+    version = _normalized_semver(rel.get("tag_name"))
+    if not version or manifest.get("release") != f"v{version}":
+        raise RuntimeError("HD Switch manifest release does not match its tag")
+    if set(manifest) != {"release", "notes", "components"}:
+        raise RuntimeError("unexpected HD Switch manifest schema")
+    components = manifest.get("components")
+    if not isinstance(components, list):
+        raise RuntimeError("HD Switch manifest components must be a list")
+    by_id = {}
+    for component in components:
+        if not isinstance(component, dict) or not isinstance(component.get("id"), str):
+            raise RuntimeError("invalid HD Switch manifest component")
+        if component["id"] in by_id:
+            raise RuntimeError("duplicate HD Switch manifest component")
+        by_id[component["id"]] = component
+    required_components = ("hdswitch", "packs", "female-full")
+    if any(component_id not in by_id for component_id in required_components):
+        raise RuntimeError("HD Switch manifest is missing a required component")
+
+    release_assets = {}
+    for asset in rel.get("assets", []):
+        name = asset.get("name")
+        if isinstance(name, str):
+            if name in release_assets:
+                raise RuntimeError(f"duplicate HD Switch release asset: {name}")
+            release_assets[name] = asset
+
+    expected = {path.replace("\\", "/").lower()
+                for path in OCTOWOW_HD_REQUIRED_FILES}
+    normalized = []
+    seen = set()
+    for component_id in required_components:
+        files = by_id[component_id].get("files")
+        if not isinstance(files, list):
+            raise RuntimeError(f"HD Switch component {component_id} has no files")
+        for item in files:
+            if not isinstance(item, dict):
+                raise RuntimeError("invalid HD Switch manifest file")
+            dest = item.get("dest")
+            if dest == "mods/HDToggle.dll":
+                dest = OCTOWOW_HD_DLL
+            if (not isinstance(dest, str) or not dest or "\\" in dest
+                    or dest.startswith("/")
+                    or any(part in ("", ".", "..") for part in dest.split("/"))):
+                raise RuntimeError(f"unsafe HD Switch destination: {dest!r}")
+            native_dest = os.path.join(*dest.split("/"))
+            _validate_client_relative_path(native_dest)
+            dest_key = dest.lower()
+            if dest_key in seen:
+                raise RuntimeError(f"duplicate HD Switch destination: {dest}")
+            if dest_key not in expected:
+                continue
+            seen.add(dest_key)
+            size = item.get("size")
+            digest = item.get("sha256")
+            if (not isinstance(size, int) or size <= 0
+                    or not isinstance(digest, str)
+                    or not re.fullmatch(r"[0-9a-fA-F]{64}", digest)):
+                raise RuntimeError(f"invalid HD Switch metadata for {dest}")
+            asset_name = item.get("asset")
+            url = item.get("url")
+            asset_id = None
+            third_party = dest in OCTOWOW_HD_THIRD_PARTY_MPQS
+            if bool(url) != third_party:
+                raise RuntimeError(
+                    f"unexpected HD Switch hosting source: {dest}")
+            if url:
+                if item.get("source") != "Project Reforged":
+                    raise RuntimeError(
+                        f"invalid HD Switch source attribution: {dest}")
+                _check_url(url, {OCTOWOW_HD_THIRD_PARTY_HOST})
+            else:
+                asset = release_assets.get(asset_name)
+                if not asset:
+                    raise RuntimeError(
+                        f"missing HD Switch release asset: {asset_name}")
+                asset_digest = _asset_sha256(asset)
+                if (asset.get("size") != size
+                        or asset_digest != digest.lower()):
+                    raise RuntimeError(
+                        f"HD Switch asset metadata mismatch: {asset_name}")
+                content_type = asset.get("content_type")
+                allowed_types = {
+                    "application/octet-stream",
+                    "application/x-msdownload",
+                    "application/vnd.microsoft.portable-executable",
+                    "application/xml",
+                    "text/xml",
+                }
+                if content_type not in allowed_types:
+                    raise RuntimeError(
+                        f"unexpected HD Switch asset type: {asset_name}")
+                url = asset.get("browser_download_url")
+                _check_url(url, ALLOWED_DOWNLOAD_HOSTS)
+                asset_id = asset.get("id")
+            normalized.append({
+                "component": component_id,
+                "asset": asset_name,
+                "asset_id": asset_id,
+                "dest": dest,
+                "size": size,
+                "sha256": digest.lower(),
+                "url": url,
+            })
+    if seen != expected:
+        missing = sorted(expected - seen)
+        raise RuntimeError(
+            "HD Switch manifest is missing required files: " + ", ".join(missing))
+    normalized.sort(key=lambda item: item["dest"].lower())
+    return {
+        "release": version,
+        "release_id": rel.get("id"),
+        "files": normalized,
+        "total_size": sum(item["size"] for item in normalized),
+    }
+
+
+def _validated_octowow_hd_release(
+        rel: dict, manifest: dict | None = None) -> tuple[str, dict, str, dict | None]:
+    if not isinstance(rel, dict):
+        raise RuntimeError("invalid HD Switch release response")
+    if rel.get("draft") or rel.get("prerelease"):
+        raise RuntimeError("refusing draft or prerelease HD Switch release")
+    version = _normalized_semver(rel.get("tag_name"))
+    if not version:
+        raise RuntimeError("invalid HD Switch release tag")
+    assets = [asset for asset in rel.get("assets", [])
+              if asset.get("name") == OCTOWOW_HD_MANIFEST]
+    if len(assets) != 1:
+        raise RuntimeError(
+            "HD Switch release must contain exactly one manifest-v2.json")
+    asset = assets[0]
+    size = asset.get("size")
+    if not isinstance(size, int) or not 0 < size <= OCTOWOW_HD_MAX_MANIFEST_BYTES:
+        raise RuntimeError("invalid HD Switch manifest asset size")
+    digest = _asset_sha256(asset)
+    if not digest:
+        raise RuntimeError("HD Switch manifest has no trustworthy SHA-256 digest")
+    url = asset.get("browser_download_url")
+    if asset.get("content_type") not in (
+            "application/json", "application/octet-stream"):
+        raise RuntimeError("unexpected HD Switch manifest content type")
+    _check_url(url, ALLOWED_DOWNLOAD_HOSTS)
+    parsed = (_validated_octowow_hd_manifest(rel, manifest)
+              if manifest is not None else None)
+    return version, asset, digest, parsed
+
+
+def _octowow_hd_fingerprint(files) -> str:
+    if isinstance(files, dict):
+        pairs = files.items()
+    else:
+        pairs = ((item["dest"], item["sha256"]) for item in files)
+    canonical = "\n".join(
+        digest for _path, digest in sorted(
+            pairs, key=lambda pair: pair[0].casefold()))
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def _fetch_octowow_hd_manifest(rel: dict) -> dict:
+    _version, asset, expected_digest, _parsed = \
+        _validated_octowow_hd_release(rel)
+    request = urllib.request.Request(
+        asset["browser_download_url"], headers={"User-Agent": UA})
+    with secure_urlopen(request, timeout=30,
+                        allowed_hosts=ALLOWED_DOWNLOAD_HOSTS) as response:
+        data = response.read(OCTOWOW_HD_MAX_MANIFEST_BYTES + 1)
+    if len(data) > OCTOWOW_HD_MAX_MANIFEST_BYTES:
+        raise RuntimeError("HD Switch manifest exceeds the size limit")
+    if len(data) != asset["size"]:
+        raise RuntimeError("HD Switch manifest size mismatch")
+    if hashlib.sha256(data).hexdigest() != expected_digest:
+        raise RuntimeError("HD Switch manifest checksum verification failed")
+    try:
+        manifest = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RuntimeError("HD Switch manifest is not valid UTF-8 JSON") from error
+    return _validated_octowow_hd_manifest(rel, manifest)
+
+
+def _octowow_hd_release_history(force: bool = False) -> list[dict]:
+    now = time.time()
+    key = "octowow_hd_release_history"
+    stale = []
+    if not force:
+        entry = load_config().get("mod_release_history_cache", {}).get(key)
+        if entry:
+            stale = entry.get("releases") or []
+            if ((now - entry.get("timestamp", 0)) < _MOD_VERSION_CACHE_TTL
+                    and stale):
+                return stale
+    releases = []
+    owner, repo = OCTOWOW_HD_REPO
+    for release in _github_releases(owner, repo):
+        slim = _slim_release(release)
+        try:
+            manifest = _fetch_octowow_hd_manifest(slim)
+        except RuntimeError:
+            continue
+        slim["hd_manifest"] = manifest
+        releases.append(slim)
+    releases.sort(
+        key=lambda item: _parse_version(item.get("tag_name")), reverse=True)
+    if releases:
+        update_config(
+            lambda config:
+            config.setdefault("mod_release_history_cache", {}).__setitem__(
+                key, {"timestamp": now, "releases": releases}))
+        return releases
+    return stale
+
+
+def _is_hdtoggle_line(line: str) -> bool:
+    normalized = line.strip().replace("\\", "/").lower()
+    return bool(normalized) and normalized.rsplit("/", 1)[-1] == "hdtoggle.dll"
+
+
+def _hdtoggle_registration(client_dir: str) -> tuple[bool, bool]:
+    matches = [line.strip() for line in _read_dlls_txt(client_dir)
+               if _is_hdtoggle_line(line)]
+    canonical = [line for line in matches
+                 if line.lower() == OCTOWOW_HD_DLL.lower()]
+    return len(matches) == 1 and len(canonical) == 1, bool(matches)
+
+
+def _hdtoggle_dlls_bytes(client_dir: str, enabled: bool) -> bytes | None:
+    kept = [line for line in _read_dlls_txt(client_dir)
+            if not _is_hdtoggle_line(line)]
+    if enabled:
+        kept.append(OCTOWOW_HD_DLL)
+    if not kept:
+        return None
+    return ("\n".join(kept) + "\n").encode("utf-8")
+
+
+def hdtoggle_pe_version(data: bytes) -> str | None:
+    _validate_pe_dll(data)
+    for key in ("ProductVersion", "FileVersion"):
+        version = _normalized_semver(_pe_string_value(data, key))
+        if version:
+            return version
+    return None
+
+
+def _octowow_hd_file_hashes(
+        client_dir: str, saved_state: dict | None = None) -> tuple[dict, dict]:
+    saved_state = saved_state or {}
+    old_stats = saved_state.get("file_stats") or {}
+    old_hashes = saved_state.get("file_hashes") or {}
+    stats, hashes = {}, {}
+    for relative in OCTOWOW_HD_REQUIRED_FILES:
+        path = _transaction_client_path(client_dir, relative)
+        if not os.path.isfile(path) or os.path.islink(path):
+            continue
+        current = os.stat(path)
+        fingerprint = [current.st_size, current.st_mtime_ns]
+        stats[relative] = fingerprint
+        if old_stats.get(relative) == fingerprint and old_hashes.get(relative):
+            hashes[relative] = old_hashes[relative]
+        else:
+            hashes[relative] = sha256_file(path)
+    return stats, hashes
+
+
+def detect_octowow_hd_state(
+        client_dir: str, saved_state: dict | None = None,
+        releases: list[dict] | None = None) -> dict:
+    saved_state = saved_state or {}
+    releases = releases or []
+    if os.path.exists(PACKAGE_TRANSACTION_POINTER):
+        try:
+            with open(PACKAGE_TRANSACTION_POINTER) as pointer_file:
+                pointer = json.load(pointer_file)
+            same_client = (
+                os.path.realpath(pointer.get("client_root", ""))
+                == os.path.realpath(client_dir))
+        except Exception:
+            same_client = True
+        if same_client:
+            return {
+                **saved_state,
+                "enabled": True,
+                "installed_version": saved_state.get("installed_version"),
+                "installed_sha256": saved_state.get("installed_sha256"),
+                "installed_files": saved_state.get("installed_files", []),
+                "file_stats": saved_state.get("file_stats", {}),
+                "file_hashes": saved_state.get("file_hashes", {}),
+                "health": "recovery_required",
+                "status": "broken",
+                "error": "An interrupted HD Switch transaction must be recovered",
+            }
+    try:
+        stats, hashes = _octowow_hd_file_hashes(client_dir, saved_state)
+    except RuntimeError as error:
+        return {
+            **saved_state,
+            "enabled": True,
+            "installed_version": None,
+            "installed_sha256": None,
+            "installed_files": [],
+            "file_stats": {},
+            "file_hashes": {},
+            "health": "corrupt",
+            "status": "broken",
+            "error": str(error),
+        }
+    present = sorted(hashes)
+    core_present = any(path in hashes for path in (
+        OCTOWOW_HD_DLL, *OCTOWOW_HD_ADDON_FILES))
+    try:
+        canonical_registration, any_registration = \
+            _hdtoggle_registration(client_dir)
+    except RuntimeError as error:
+        canonical_registration, any_registration = False, True
+        registration_error = str(error)
+    else:
+        registration_error = None
+
+    if not core_present and not any_registration:
+        return {
+            **saved_state,
+            "enabled": False,
+            "installed_version": None,
+            "installed_files": [],
+            "file_stats": stats,
+            "file_hashes": hashes,
+            "health": "absent",
+            "status": "not_installed",
+            "error": None,
+        }
+
+    invalid = []
+    metadata_versions = set()
+    for relative in OCTOWOW_HD_REQUIRED_FILES:
+        path = os.path.join(client_dir, *relative.split("/"))
+        if os.path.lexists(path) and os.path.islink(path):
+            invalid.append(relative + " (symlink)")
+            continue
+        parent = os.path.dirname(path)
+        if not os.path.isdir(parent):
+            continue
+        expected_name = os.path.basename(path)
+        matches = [name for name in os.listdir(parent)
+                   if name.casefold() == expected_name.casefold()]
+        if len(matches) > 1 or (matches and expected_name not in matches):
+            invalid.append(relative + " (case conflict)")
+    dll_path = os.path.join(client_dir, OCTOWOW_HD_DLL)
+    if os.path.exists(dll_path):
+        try:
+            embedded_version = hdtoggle_pe_version(Path(dll_path).read_bytes())
+            if embedded_version:
+                metadata_versions.add(embedded_version)
+        except (OSError, RuntimeError):
+            invalid.append(OCTOWOW_HD_DLL)
+    toc_path = os.path.join(
+        client_dir, "Interface", "AddOns", OCTOWOW_HD_ADDON, "HDSwitch.toc")
+    if os.path.exists(toc_path):
+        toc = read_toc_file(toc_path)
+        toc_version = _normalized_semver(toc.get("Version"))
+        if toc.get("Interface") != "11200" or not toc_version:
+            invalid.append("Interface/AddOns/HDSwitch/HDSwitch.toc")
+        else:
+            metadata_versions.add(toc_version)
+
+    matching_versions = []
+    matching_fingerprints = {}
+    file_versions = {relative: set()
+                     for relative in OCTOWOW_HD_REQUIRED_FILES}
+    for release in releases:
+        manifest = release.get("hd_manifest") or {}
+        version = manifest.get("release")
+        files = manifest.get("files") or []
+        if not version or not files:
+            continue
+        matched = set()
+        for item in files:
+            if hashes.get(item["dest"]) == item["sha256"]:
+                matched.add(item["dest"])
+                file_versions[item["dest"]].add(version)
+        if len(matched) == len(OCTOWOW_HD_REQUIRED_FILES):
+            matching_versions.append(version)
+            matching_fingerprints[version] = \
+                _octowow_hd_fingerprint(files)
+    matching_versions.sort(key=_parse_version, reverse=True)
+    matched_version = matching_versions[0] if matching_versions else None
+    metadata_version = (
+        next(iter(metadata_versions)) if len(metadata_versions) == 1 else None)
+    missing = sorted(set(OCTOWOW_HD_REQUIRED_FILES) - set(present))
+    current_fingerprint = None
+    if not missing:
+        current_fingerprint = _octowow_hd_fingerprint(hashes)
+
+    vf_ready = all(os.path.exists(os.path.join(client_dir, name))
+                   for name in ("VanillaFixes.exe", "VfPatcher.dll"))
+    client_version = get_client_version(client_dir)
+    if invalid:
+        health = "corrupt"
+        error = "Invalid HD Switch files: " + ", ".join(invalid)
+    elif missing:
+        health = "partial"
+        error = f"HD Switch is missing {len(missing)} required file(s)"
+    elif len(metadata_versions) > 1:
+        health = "mixed_version"
+        error = "HDToggle.dll and HDSwitch.toc versions disagree"
+    elif not canonical_registration:
+        health = "registration_disabled"
+        error = registration_error or (
+            "dlls.txt contains a missing, duplicate, or non-canonical "
+            "HDToggle.dll entry")
+    elif not vf_ready:
+        health = "dependency_blocked"
+        error = "VanillaFixes is required to load HDToggle.dll"
+    elif client_version and client_version != "1.12.1 (5875)":
+        health = "dependency_blocked"
+        error = (
+            "OctoWoW HD Switch requires WoW 1.12.1 build 5875 "
+            f"(found {client_version})")
+    elif matched_version:
+        latest = ((releases[0].get("hd_manifest") or {}).get("release")
+                  if releases else None)
+        health = ("complete_current" if matched_version == latest
+                  else "complete_outdated")
+        error = None
+    elif all(file_versions.values()):
+        health = "mixed_version"
+        error = "HD Switch components come from different releases"
+    else:
+        health = "manual_unknown"
+        error = None
+
+    return {
+        **saved_state,
+        "enabled": True,
+        "installed_version": matched_version or metadata_version,
+        "installed_sha256": (
+            matching_fingerprints.get(matched_version)
+            or current_fingerprint),
+        "installed_files": present,
+        "file_stats": stats,
+        "file_hashes": hashes,
+        "health": health,
+        "status": ("installed" if health in (
+                       "complete_current", "complete_outdated") else
+                   "installed_unknown" if health == "manual_unknown" else
+                   "broken"),
+        "error": error,
+    }
+
+
+_PACKAGE_TRANSACTION_VERSION = 1
+_PACKAGE_TRANSACTION_PREFIX = ".octo-package-"
+
+
+class FileSetTransaction:
+    """Journaled replacement/removal of files beneath one game directory."""
+
+    def __init__(self, client_dir: str, pointer_path: str | None = None,
+                 transaction_id: str | None = None):
+        self.client_root = os.path.realpath(os.path.abspath(client_dir))
+        self.id = _validate_transaction_id(transaction_id or uuid.uuid4().hex)
+        self.transaction_dir = os.path.join(
+            self.client_root, _PACKAGE_TRANSACTION_PREFIX + self.id)
+        self.backup_dir = os.path.join(self.transaction_dir, "backups")
+        self.journal_path = os.path.join(self.transaction_dir, "journal.json")
+        self.pointer_path = pointer_path or PACKAGE_TRANSACTION_POINTER
+        self.data = {
+            "version": _PACKAGE_TRANSACTION_VERSION,
+            "id": self.id,
+            "client_root": self.client_root,
+            "state": "PREPARING",
+            "entries": [],
+        }
+
+    def _save(self):
+        _write_json_atomic(self.journal_path, self.data)
+
+    def _save_pointer(self):
+        _write_json_atomic(self.pointer_path, {
+            "version": _PACKAGE_TRANSACTION_VERSION,
+            "id": self.id,
+            "client_root": self.client_root,
+        })
+
+    def _backup_path(self, entry: dict) -> str:
+        relative = _validate_client_relative_path(entry["backup"])
+        path = os.path.abspath(os.path.join(self.transaction_dir, relative))
+        if os.path.commonpath((self.transaction_dir, path)) != \
+                self.transaction_dir:
+            raise RuntimeError("package backup path escapes transaction directory")
+        parent = os.path.dirname(path)
+        if os.path.lexists(parent) and os.path.islink(parent):
+            raise RuntimeError("package backup directory is a symlink")
+        return path
+
+    def apply(self, replacements: dict[str, str | None]):
+        if os.path.lexists(self.transaction_dir):
+            raise RuntimeError("package transaction directory already exists")
+        entries = []
+        normalized_replacements = {}
+        for relative in sorted(replacements, key=str.lower):
+            if (not isinstance(relative, str) or "\\" in relative
+                    or any(part in ("", ".", "..")
+                           for part in relative.split("/"))):
+                raise RuntimeError(f"unsafe package path: {relative!r}")
+            native_relative = _validate_client_relative_path(
+                os.path.join(*relative.split("/")))
+            path = _transaction_client_path(
+                self.client_root, native_relative)
+            if os.path.lexists(path) and os.path.islink(path):
+                raise RuntimeError(f"refusing package symlink: {relative}")
+            replacement = replacements[relative]
+            if replacement is not None and not os.path.exists(replacement):
+                raise RuntimeError(f"missing staged package file: {relative}")
+            normalized_replacements[native_relative] = replacement
+            entries.append({
+                "path": native_relative,
+                "backup": os.path.join("backups", f"{len(entries):04d}.bak"),
+                "existed": os.path.exists(path),
+                "state": "planned",
+            })
+        os.makedirs(self.backup_dir)
+        self.data["entries"] = entries
+        self._save()
+        self._save_pointer()
+        try:
+            for entry in entries:
+                relative = entry["path"]
+                path = _transaction_client_path(self.client_root, relative)
+                replacement = normalized_replacements[relative]
+                backup = self._backup_path(entry)
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                entry["state"] = "backup_pending"
+                self._save()
+                if entry["existed"]:
+                    os.replace(path, backup)
+                entry["state"] = "backup_ready"
+                self._save()
+                if replacement is not None:
+                    staged = f"{path}.octo-stage-{self.id}"
+                    try:
+                        if os.path.isdir(replacement):
+                            shutil.copytree(replacement, staged)
+                        else:
+                            shutil.copyfile(replacement, staged)
+                            with open(staged, "rb") as staged_file:
+                                os.fsync(staged_file.fileno())
+                        os.replace(staged, path)
+                    except BaseException:
+                        if os.path.isdir(staged):
+                            _rmtree_force(staged)
+                        elif os.path.exists(staged):
+                            os.remove(staged)
+                        raise
+                entry["state"] = "committed"
+                self._save()
+            self.data["state"] = "COMMITTED"
+            self._save()
+        except BaseException:
+            self.rollback()
+            raise
+
+    def commit(self):
+        if self.data.get("state") != "COMMITTED":
+            raise RuntimeError("package transaction is not ready to commit")
+        self.data["state"] = "FINALIZING"
+        self._save()
+        self._clear()
+
+    def rollback(self):
+        self.data["state"] = "ROLLING_BACK"
+        self._save()
+        for entry in reversed(self.data["entries"]):
+            path = _transaction_client_path(self.client_root, entry["path"])
+            backup = self._backup_path(entry)
+            if entry.get("state") in ("backup_ready", "committed"):
+                if entry["existed"] and not os.path.exists(backup):
+                    raise RuntimeError(
+                        f"missing package backup: {entry['path']}")
+                if os.path.exists(path):
+                    if os.path.isdir(path):
+                        _rmtree_force(path)
+                    else:
+                        os.remove(path)
+                if entry["existed"] and os.path.exists(backup):
+                    os.replace(backup, path)
+            entry["state"] = "restored"
+            self._save()
+        self._clear()
+
+    def _clear(self):
+        try:
+            with open(self.pointer_path) as pointer_file:
+                pointer = json.load(pointer_file)
+            if pointer.get("id") == self.id:
+                os.remove(self.pointer_path)
+        except FileNotFoundError:
+            pass
+        shutil.rmtree(self.transaction_dir)
+
+    @classmethod
+    def from_pointer(cls, pointer_path: str | None = None):
+        pointer_path = pointer_path or PACKAGE_TRANSACTION_POINTER
+        with open(pointer_path) as pointer_file:
+            pointer = json.load(pointer_file)
+        if pointer.get("version") != _PACKAGE_TRANSACTION_VERSION:
+            raise RuntimeError("unsupported package transaction version")
+        transaction_id = _validate_transaction_id(pointer.get("id"))
+        client_root = pointer.get("client_root")
+        if not isinstance(client_root, str) or not os.path.isabs(client_root):
+            raise RuntimeError("invalid package transaction game folder")
+        tx = cls(client_root, pointer_path=pointer_path,
+                 transaction_id=transaction_id)
+        if os.path.realpath(tx.transaction_dir) != tx.transaction_dir:
+            raise RuntimeError("package transaction directory is a symlink")
+        with open(tx.journal_path) as journal_file:
+            tx.data = json.load(journal_file)
+        if (tx.data.get("version") != _PACKAGE_TRANSACTION_VERSION
+                or tx.data.get("id") != tx.id
+                or os.path.realpath(tx.data.get("client_root", ""))
+                != tx.client_root):
+            raise RuntimeError("package transaction journal does not match pointer")
+        return tx
+
+
+def recover_interrupted_package_transaction(
+        pointer_path: str | None = None) -> bool:
+    pointer_path = pointer_path or PACKAGE_TRANSACTION_POINTER
+    if not os.path.exists(pointer_path):
+        return False
+    FileSetTransaction.from_pointer(pointer_path).rollback()
+    return True
+
+
+def _validate_mpq_file(path: str):
+    with open(path, "rb") as source:
+        header = source.read(4096)
+    if b"MPQ\x1a" not in header and b"MPQ\x1b" not in header:
+        raise RuntimeError(f"{os.path.basename(path)} is not a valid MPQ archive")
+
+
+def _download_verified_file(item: dict, destination: str, on_progress=None):
+    request = urllib.request.Request(item["url"], headers={"User-Agent": UA})
+    digest = hashlib.sha256()
+    done = 0
+    with secure_urlopen(
+            request, timeout=DOWNLOAD_TIMEOUT,
+            allowed_hosts=ALLOWED_DOWNLOAD_HOSTS | {
+                OCTOWOW_HD_THIRD_PARTY_HOST}) as response, \
+            open(destination, "wb") as output:
+        while True:
+            chunk = response.read(1024 * 1024)
+            if not chunk:
+                break
+            done += len(chunk)
+            if done > item["size"]:
+                raise RuntimeError(f"{item['dest']} exceeds its declared size")
+            output.write(chunk)
+            digest.update(chunk)
+            if on_progress:
+                on_progress(item["dest"], done, item["size"])
+        output.flush()
+        os.fsync(output.fileno())
+    if done != item["size"] or digest.hexdigest() != item["sha256"]:
+        raise RuntimeError(f"{item['dest']} checksum or size verification failed")
+
+
+def install_octowow_hd(
+        client_dir: str, release: dict, on_progress=None) -> tuple[list, str, str]:
+    import tempfile
+    if not all(os.path.isfile(os.path.join(client_dir, name))
+               for name in ("VanillaFixes.exe", "VfPatcher.dll")):
+        raise RuntimeError("VanillaFixes must be installed before HD Switch")
+    client_version = get_client_version(client_dir)
+    if client_version != "1.12.1 (5875)":
+        raise RuntimeError(
+            "HD Switch requires WoW 1.12.1 build 5875 "
+            f"(found {client_version or 'an unknown build'})")
+    manifest = release.get("hd_manifest") or _fetch_octowow_hd_manifest(release)
+    version = manifest["release"]
+    total = manifest["total_size"]
+    margin = max(total // 20, 64 * 1024 * 1024)
+    if shutil.disk_usage(client_dir).free < total + margin:
+        raise RuntimeError("not enough free disk space for OctoWoW HD Switch")
+    ensure_dir(APP_DATA_DIR)
+    if shutil.disk_usage(APP_DATA_DIR).free < total + margin:
+        raise RuntimeError("not enough temporary disk space for OctoWoW HD Switch")
+    with tempfile.TemporaryDirectory(
+            prefix="octowow-hd-", dir=APP_DATA_DIR) as staging:
+        replacements = {}
+        completed = 0
+        for index, item in enumerate(manifest["files"]):
+            staged = os.path.join(staging, f"{index:03d}.download")
+            log(f"  Downloading {item['dest']} ({fmt_size(item['size'])})...")
+            def progress(name, done, _file_total, base=completed):
+                if on_progress:
+                    on_progress(name, base + done, total)
+            _download_verified_file(item, staged, on_progress=progress)
+            completed += item["size"]
+            if item["dest"] == OCTOWOW_HD_DLL:
+                embedded = hdtoggle_pe_version(Path(staged).read_bytes())
+                if embedded and embedded != version:
+                    raise RuntimeError(
+                        f"HDToggle.dll version {embedded} does not match {version}")
+            elif item["dest"].lower().endswith(".mpq"):
+                _validate_mpq_file(staged)
+            replacements[item["dest"]] = staged
+
+        toc_item = next(item for item in manifest["files"]
+                        if item["dest"].endswith("HDSwitch.toc"))
+        toc = read_toc_file(replacements[toc_item["dest"]])
+        if (toc.get("Interface") != "11200"
+                or _normalized_semver(toc.get("Version")) != version):
+            raise RuntimeError("HDSwitch.toc metadata does not match the release")
+
+        addon_staged = os.path.join(staging, OCTOWOW_HD_ADDON)
+        os.makedirs(addon_staged)
+        for relative in OCTOWOW_HD_ADDON_FILES:
+            shutil.copyfile(
+                replacements.pop(relative),
+                os.path.join(addon_staged, Path(relative).name))
+        replacements["Interface/AddOns/HDSwitch"] = addon_staged
+
+        dlls = _hdtoggle_dlls_bytes(client_dir, enabled=True)
+        dlls_staged = os.path.join(staging, "dlls.txt")
+        with open(dlls_staged, "wb") as output:
+            output.write(dlls or b"")
+            output.flush()
+            os.fsync(output.fileno())
+        replacements["dlls.txt"] = dlls_staged
+
+        tx = FileSetTransaction(client_dir)
+        tx.apply(replacements)
+        try:
+            for item in manifest["files"]:
+                installed = os.path.join(
+                    client_dir, *item["dest"].split("/"))
+                if sha256_file(installed) != item["sha256"]:
+                    raise RuntimeError(
+                        f"installed {item['dest']} failed post-write verification")
+        except BaseException:
+            tx.rollback()
+            raise
+        tx.commit()
+    fingerprint = _octowow_hd_fingerprint(manifest["files"])
+    return list(OCTOWOW_HD_REQUIRED_FILES), version, fingerprint
+
+
+def uninstall_octowow_hd(client_dir: str):
+    import tempfile
+    with tempfile.TemporaryDirectory(
+            prefix="octowow-hd-remove-", dir=APP_DATA_DIR) as staging:
+        replacements = {
+            OCTOWOW_HD_DLL: None,
+            "HDToggle.ini": None,
+            "HDToggle.log": None,
+            "Interface/AddOns/HDSwitch": None,
+        }
+        dlls = _hdtoggle_dlls_bytes(client_dir, enabled=False)
+        if dlls is None:
+            replacements["dlls.txt"] = None
+        else:
+            dlls_staged = os.path.join(staging, "dlls.txt")
+            with open(dlls_staged, "wb") as output:
+                output.write(dlls)
+                output.flush()
+                os.fsync(output.fileno())
+            replacements["dlls.txt"] = dlls_staged
+        tx = FileSetTransaction(client_dir)
+        tx.apply(replacements)
+        tx.commit()
+
+
+def install_mod(mod: dict, client_dir: str, release: dict | None = None,
+                on_progress=None) -> list:
     src     = mod["source"]
     written = []
 
@@ -2816,6 +3663,24 @@ def install_mod(mod: dict, client_dir: str, release: dict | None = None) -> list
         mod["_resolved_sha256"] = digest
         mod["_resolved_release_id"] = rel.get("id")
         mod["_resolved_asset_id"] = asset.get("id")
+        return written
+
+    if mod.get("transaction_hook") == "octowow_hd":
+        rel = release
+        if rel is None or "hd_manifest" not in rel:
+            history = _octowow_hd_release_history(force=True)
+            rel = history[0] if history else None
+        if not rel:
+            raise RuntimeError("no valid HD Switch release found on GitHub")
+        written, version, digest = install_octowow_hd(
+            client_dir, rel, on_progress=on_progress)
+        mod["_resolved_version"] = version
+        mod["_resolved_sha256"] = digest
+        mod["_resolved_release_id"] = rel.get("id")
+        manifest_asset = next(
+            asset for asset in rel.get("assets", [])
+            if asset.get("name") == OCTOWOW_HD_MANIFEST)
+        mod["_resolved_asset_id"] = manifest_asset.get("id")
         return written
 
     if src["kind"] == "codeberg_release":
@@ -3042,6 +3907,9 @@ def uninstall_mod(mod: dict, client_dir: str):
     if mod.get("transaction_hook") == "octologin":
         uninstall_octologin(client_dir)
         return
+    if mod.get("transaction_hook") == "octowow_hd":
+        uninstall_octowow_hd(client_dir)
+        return
     cfg   = load_config()
     state = cfg.get("mods", {}).get(mod["id"], {})
     files = state.get("installed_files", mod.get("installed_files", []))
@@ -3088,6 +3956,12 @@ def mod_installed_files_present(mod: dict, client_dir: str) -> bool:
 
 
 def mod_state_installed(state: dict) -> bool:
+    if state.get("health") in {
+            "complete_current", "complete_outdated", "partial",
+            "mixed_version", "manual_unknown", "corrupt",
+            "registration_disabled", "dependency_blocked",
+            "recovery_required"}:
+        return True
     return bool(state.get("installed_version")
                 or state.get("status") in ("installed", "installed_unknown"))
 
@@ -3110,6 +3984,14 @@ def mod_update_available(mod: dict, state: dict, live: dict | None) -> bool:
     if not state.get("enabled", False):
         return False
     if state.get("ignore_updates", False):
+        return False
+    if mod["id"] == OCTOWOW_HD_ID:
+        if state.get("health") == "complete_outdated":
+            return True
+        if (state.get("health") in ("complete_current", "manual_unknown")
+                and state.get("installed_sha256")
+                and (live or {}).get("latest_sha256")):
+            return state["installed_sha256"] != live["latest_sha256"]
         return False
     installed_ver = _normalized_semver(state.get("installed_version"))
     if not installed_ver:
@@ -3192,6 +4074,17 @@ ADDON_ZIP_HOSTS = {"github.com", "codeload.github.com", "gitlab.com",
 
 def addons_path(client_dir: str) -> str:
     return os.path.join(client_dir, "Interface", "AddOns")
+
+
+def package_owned_addon(folder: str) -> bool:
+    return folder.casefold() == OCTOWOW_HD_ADDON.casefold()
+
+
+def package_owned_mpq(filename: str) -> bool:
+    return any(
+        filename.casefold() == Path(relative).name.casefold()
+        for relative in OCTOWOW_HD_REQUIRED_MPQS
+    )
 
 
 def is_allowed_git_url(url: str) -> bool:
@@ -3923,10 +4816,11 @@ class OctoUpdaterApp(tk.Tk):
         self._cfg        = load_config()
         self._recovery_error = None
         try:
+            recover_interrupted_package_transaction()
             recover_interrupted_verify()
         except Exception as e:
             self._recovery_error = str(e)
-            log(f"Interrupted Verify recovery failed: {e}", "err")
+            log(f"Interrupted transaction recovery failed: {e}", "err")
         # Pending reconcile mode (None = none): _offer_reconcile surfaces the
         # Update button and the Update the user clicks runs an integrity pass
         # instead of a routine size-based sync. "full" also writes a fresh
@@ -5337,6 +6231,29 @@ class OctoUpdaterApp(tk.Tk):
         cfg = load_config()
         client_dir = cfg.get("out_dir", DEFAULT_GAME_DIR)
         for mod in MODS_REGISTRY:
+            if mod.get("detect_hook") == "octowow_hd":
+                try:
+                    history = _octowow_hd_release_history()
+                    detected = detect_octowow_hd_state(
+                        client_dir,
+                        load_config().get("mods", {}).get(mod["id"], {}),
+                        history)
+                    update_config(
+                        lambda c, mid=mod["id"], value=detected:
+                        c.setdefault("mods", {}).__setitem__(mid, value))
+                    if history:
+                        latest = history[0]["hd_manifest"]
+                        state.append({
+                            "id": mod["id"],
+                            "latest_version": latest["release"],
+                            "latest_sha256":
+                                _octowow_hd_fingerprint(latest["files"]),
+                            "release_id": history[0].get("id"),
+                            "total_size": latest["total_size"],
+                        })
+                except Exception:
+                    pass
+                continue
             release = None
             try:
                 release = (_fetch_release_cached(mod)
@@ -5523,7 +6440,9 @@ class OctoUpdaterApp(tk.Tk):
         hidden otherwise. Both do the same thing — reinstall the mod."""
         if state.get("error"):
             lbl._base, lbl._hover = C_GOLD, C_GOLD_LT
-            lbl.configure(text="retry", fg=C_GOLD)
+            lbl.configure(
+                text=("repair" if mod["id"] == OCTOWOW_HD_ID else "retry"),
+                fg=C_GOLD)
             lbl.pack(side="right", padx=(self._px(2), self._px(8)))
         elif mod_update_available(mod, state, live):
             lbl._base, lbl._hover = C_GOLD, C_GOLD_LT
@@ -5686,7 +6605,7 @@ class OctoUpdaterApp(tk.Tk):
             needs_install   = enabled and not is_installed
             needs_uninstall = (not enabled and
                                (is_installed or
-                                (mod.get("transaction_hook") == "octologin"
+                                (mod.get("transaction_hook")
                                  and state.get("enabled"))))
 
             needs_version_lookup = needs_install or (enabled and is_installed and not ignore_upd)
@@ -5695,7 +6614,15 @@ class OctoUpdaterApp(tk.Tk):
             mod_release = None
             if needs_version_lookup:
                 try:
-                    if mod["source"]["kind"] in ("github_release", "codeberg_release"):
+                    if mod.get("transaction_hook") == "octowow_hd":
+                        history = _octowow_hd_release_history()
+                        mod_release = history[0] if history else None
+                        if mod_release:
+                            manifest = mod_release["hd_manifest"]
+                            latest_ver = manifest["release"]
+                            latest_sha256 = \
+                                _octowow_hd_fingerprint(manifest["files"])
+                    elif mod["source"]["kind"] in ("github_release", "codeberg_release"):
                         mod_release = _fetch_release_cached(mod)
                         latest_ver  = _release_version(mod, mod_release) if mod_release else None
                         if mod.get("transaction_hook") == "octologin" and mod_release:
@@ -5742,7 +6669,14 @@ class OctoUpdaterApp(tk.Tk):
             try:
                 if needs_install:
                     log(f"\nInstalling {mod['name']} {latest_ver}...")
-                    written = install_mod(mod, client_dir, release=mod_release)
+                    progress = None
+                    if mid == OCTOWOW_HD_ID:
+                        progress = lambda _name, done, total: self.after(
+                            0, lambda d=done, t=total:
+                            self._draw_progress(d / max(t, 1)))
+                    written = install_mod(
+                        mod, client_dir, release=mod_release,
+                        on_progress=progress)
                     if (mod.get("register_dll")
                             and not mod.get("transaction_hook")):
                         add_dll(client_dir, mod["register_dll"])
@@ -5762,6 +6696,8 @@ class OctoUpdaterApp(tk.Tk):
                         "ignore_updates":    ignore_upd,
                         "error":             None,
                     }
+                    if mid == OCTOWOW_HD_ID:
+                        mods_cfg[mid]["health"] = "complete_current"
                     if mid == "dxvk":
                         set_dxvk_notice = True
                     log(f"  \u2713 {mod['name']} installed.")
@@ -5784,13 +6720,22 @@ class OctoUpdaterApp(tk.Tk):
                         "ignore_updates":    ignore_upd,
                         "error":             None,
                     }
+                    if mid == OCTOWOW_HD_ID:
+                        mods_cfg[mid]["health"] = "absent"
                     log(f"  \u2713 {mod['name']} uninstalled.")
 
                 elif needs_update:
                     log(f"\nUpdating {mod['name']} {installed_ver} \u2192 {latest_ver}...")
                     if not mod.get("transaction_hook"):
                         uninstall_mod(mod, client_dir)
-                    written = install_mod(mod, client_dir, release=mod_release)
+                    progress = None
+                    if mid == OCTOWOW_HD_ID:
+                        progress = lambda _name, done, total: self.after(
+                            0, lambda d=done, t=total:
+                            self._draw_progress(d / max(t, 1)))
+                    written = install_mod(
+                        mod, client_dir, release=mod_release,
+                        on_progress=progress)
                     if (mod.get("register_dll")
                             and not mod.get("transaction_hook")):
                         add_dll(client_dir, mod["register_dll"])
@@ -5810,6 +6755,8 @@ class OctoUpdaterApp(tk.Tk):
                         "ignore_updates":    ignore_upd,
                         "error":             None,
                     }
+                    if mid == OCTOWOW_HD_ID:
+                        mods_cfg[mid]["health"] = "complete_current"
                     if mid == "dxvk":
                         set_dxvk_notice = True
                     log(f"  \u2713 {mod['name']} updated.")
@@ -5820,6 +6767,12 @@ class OctoUpdaterApp(tk.Tk):
                 if mod.get("detect_hook") == "octologin":
                     detected = detect_octologin_state(
                         client_dir, state, _octologin_release_history())
+                    detected["ignore_updates"] = ignore_upd
+                    detected["error"] = err
+                    mods_cfg[mid] = detected
+                elif mod.get("detect_hook") == "octowow_hd":
+                    detected = detect_octowow_hd_state(
+                        client_dir, state, _octowow_hd_release_history())
                     detected["ignore_updates"] = ignore_upd
                     detected["error"] = err
                     mods_cfg[mid] = detected
@@ -6045,7 +6998,8 @@ class OctoUpdaterApp(tk.Tk):
         found = []
         if data_dir and os.path.isdir(data_dir):
             for name in os.listdir(data_dir):
-                if re.fullmatch(r"patch-[a-z]\.mpq", name, re.IGNORECASE):
+                if (re.fullmatch(r"patch-[a-z]\.mpq", name, re.IGNORECASE)
+                        and not package_owned_mpq(name)):
                     found.append(name)
         found.sort(key=str.lower)
         return found
@@ -6248,7 +7202,9 @@ class OctoUpdaterApp(tk.Tk):
                           "ref": a.get("ref"), "toc": a.get("toc") or {},
                           "description": a.get("description"), "error": None}
                          for a in catalog
-                         if a.get("name") and a["name"] not in BLOCKED_ADDONS]
+                         if (a.get("name")
+                             and a["name"] not in BLOCKED_ADDONS
+                             and not package_owned_addon(a["name"]))]
 
             # Curated recommendations: apply git-URL overrides on top of the
             # catalog, and synthesize entries for recommended addons the
@@ -6271,6 +7227,8 @@ class OctoUpdaterApp(tk.Tk):
             if ap and os.path.isdir(ap):
                 for name in sorted(os.listdir(ap)):
                     if name.startswith(("Blizzard_", "Turtle_")):
+                        continue
+                    if package_owned_addon(name):
                         continue
                     dirp = os.path.join(ap, name)
                     if not os.path.isdir(dirp):

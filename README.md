@@ -33,6 +33,7 @@ Codeberg releases and registered in `dlls.txt`:
 | Nampower                | Reduces input lag on higher latency; expands the addon API                          |
 | No1600x1200             | Fixes incorrect resolution when the monitor's native res isn't detected (optional) |
 | OctoLogin               | Provides OctoWoW login and world-server selection inside the client (optional)     |
+| OctoWoW HD Switch       | Installs and manages the HD toggle DLL, addon, and required HD packs as one package |
 | SuperWoW                | Backported client API features; required by some addons                            |
 | TransmogFix             | Fixes transmog-related frame drops on character death                              |
 | UnitXP_SP3              | Frame limiter, improved targeting, anti-aliased combat text, and more              |
@@ -52,6 +53,23 @@ Codeberg releases and registered in `dlls.txt`:
   version cannot be identified is shown as unknown and can be reinstalled.
   Updating preserves `OctoLogin.ini` and `OctoLogin.log`; removing the mod
   deletes the DLL, INI and log.
+- OctoWoW HD Switch is one optional Mods-row package even though it spans the
+  client root, `Data`, and `Interface/AddOns`. It installs `HDToggle.dll` in the
+  client root, registers the canonical `HDToggle.dll` line in `dlls.txt`, owns
+  the `HDSwitch` addon, and installs 16 required MPQs:
+  `A,B,C,D,E,F,G,H,I,M,O,P,S,T,X,Z`. Patch X is part of OctoUpdater's required
+  baseline; optional Patch W and age-gated Patch Y are not installed.
+- The required HD pack download is roughly 9.44 GiB (10.14 GB decimal).
+  Installation verifies the release manifest and every file's SHA-256, stages
+  all content before changing the game folder, and uses a journaled transaction
+  with rollback/recovery.
+  Updating preserves `HDToggle.ini`, `HDToggle.log`, SavedVariables, and optional
+  packs. Removing HD Switch follows upstream semantics: it removes the root DLL,
+  runtime INI/log, addon, and loader registration while leaving all HD MPQs in
+  place.
+- VanillaFixes and WoW 1.12.1 build 5875 are required by HD Switch.
+  File management works on every OctoUpdater host platform; upstream documents
+  macOS/Wine testing and explicitly says Windows runtime testing is pending.
 - When VanillaFixes is installed, **PLAY** launches through it instead of
   `WoW.exe` directly. On native Linux, Octo Updater asks Lutris to launch the
   selected registered game; verify Lutris uses `VanillaFixes.exe` when needed.
@@ -90,6 +108,9 @@ sounds for boss abilities in raids. Each patch is downloaded over HTTPS and
 verified against a published checksum before it's placed in the client's
 `Data` folder; the tab flags available updates.
 
+MPQs owned by the OctoWoW HD Switch composite package are intentionally hidden
+from this tab so they cannot show contradictory independent actions or badges.
+
 ### News
 
 Shows the latest **Announcements** post and the current **Patch Notes** list
@@ -113,6 +134,14 @@ verification/updates.
   the DLL plus `dlls.txt` transactionally with rollback. The upstream release
   has no detached signature or author-published checksum, so this still trusts
   the repository owner's GitHub account and GitHub's release metadata.
+- OctoWoW HD Switch validates stable GitHub releases, GitHub API SHA-256
+  digests, `manifest-v2.json`, exact paths/sizes/hashes, PE/addon/MPQ structure,
+  and the upstream-pinned hashes for third-party Project Reforged packs. It
+  never executes the upstream installer or downloaded DLL. The DLL/addon source
+  is not public, 11 large Project Reforged files are authenticated only by
+  hashes asserted in the upstream manifest, and the upstream project uses a
+  restrictive non-OSS license; OctoUpdater downloads in place and does not
+  mirror or redistribute those assets.
 - On Windows, `aria2c` is fetched once and SHA-256-verified before it's ever
   run. Native Linux/macOS runs use the system-installed executable.
 - Atomic config writes (temp + rename) with a lock — safe against concurrent
@@ -151,6 +180,8 @@ verification/updates.
   `sudo dnf install aria2` on Fedora, or `brew install aria2` with Homebrew.
 - The prebuilt `OctoUpdater.exe` needs nothing installed. `aria2c` is
   downloaded automatically the first time a game update runs.
+- Installing OctoWoW HD Switch requires roughly 9.44 GiB for the final packs
+  plus comparable temporary free space while downloads are validated.
 
 ---
 
