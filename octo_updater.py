@@ -308,16 +308,40 @@ def _lutris_candidate_label(game) -> str:
     )
 
 
+def _lutris_directory_match_kind(candidate: str, wanted: str) -> str | None:
+    if candidate == wanted:
+        return "exact directory"
+
+    try:
+        relative_parts = Path(os.path.relpath(wanted, candidate)).parts
+    except ValueError:
+        relative_parts = ()
+    if relative_parts and relative_parts[0].casefold() == "drive_c":
+        return "Wine prefix"
+
+    wanted_path = Path(wanted)
+    candidate_path = Path(candidate)
+    if (wanted_path.name.casefold() == "client"
+            and candidate_path.name.casefold() == "wine"
+            and wanted_path.parent == candidate_path.parent):
+        return "separate client/Wine layout"
+    if (wanted_path.name.casefold() == "client"
+            and wanted_path.parent == candidate_path
+            and os.path.isdir(os.path.join(candidate, "wine"))):
+        return "separate client/Wine layout"
+    return None
+
+
 def matching_lutris_games(raw_json: str, client_dir: str,
                           diagnostics: list[str] | None = None) -> list[dict]:
-    """Return exact or closest Wine-prefix directory matches."""
+    """Return exact or closest supported Lutris directory matches."""
     games = json.loads(raw_json)
     if not isinstance(games, list):
         raise ValueError("Lutris returned JSON that is not a game list")
 
     wanted = _normalized_real_path(client_dir)
     exact_matches = []
-    prefix_matches = []
+    fallback_matches = []
     rejections = []
     for game in games:
         label = _lutris_candidate_label(game)
@@ -342,47 +366,44 @@ def matching_lutris_games(raw_json: str, client_dir: str,
             "runner": "wine",
             "directory": directory,
         }
-        if candidate == wanted:
+        match_kind = _lutris_directory_match_kind(candidate, wanted)
+        if match_kind == "exact directory":
             exact_matches.append(match)
             continue
-        try:
-            relative = os.path.relpath(wanted, candidate)
-        except ValueError:
-            relative = os.pardir
-        relative_parts = Path(relative).parts
-        if (not relative_parts or relative_parts[0].casefold() != "drive_c"):
+        if match_kind is None:
             rejections.append(
-                f"{label}: rejected (not an exact directory or Wine-prefix "
-                f"drive_c ancestor: target={wanted!r}, "
+                f"{label}: rejected (not an exact directory, Wine-prefix "
+                f"drive_c ancestor, or separate client/Wine layout: "
+                f"target={wanted!r}, "
                 f"candidate={candidate!r})")
             continue
-        prefix_matches.append((candidate, match, label))
+        fallback_matches.append((candidate, match, label, match_kind))
 
     if exact_matches:
         matches = exact_matches
-        for candidate, _, label in prefix_matches:
+        for candidate, _, label, match_kind in fallback_matches:
             rejections.append(
                 f"{label}: rejected (exact directory match takes precedence "
-                f"over Wine-prefix ancestor {candidate!r})")
-    elif prefix_matches:
+                f"over {match_kind} {candidate!r})")
+    elif fallback_matches:
         closest_depth = max(
             len(Path(candidate).parts)
-            for candidate, _, _ in prefix_matches)
+            for candidate, _, _, _ in fallback_matches)
         closest = [
-            (candidate, match, label)
-            for candidate, match, label in prefix_matches
+            (candidate, match, label, match_kind)
+            for candidate, match, label, match_kind in fallback_matches
             if len(Path(candidate).parts) == closest_depth
         ]
-        matches = [match for _, match, _ in closest]
-        closest_ids = {match["id"] for _, match, _ in closest}
-        for candidate, match, label in prefix_matches:
+        matches = [match for _, match, _, _ in closest]
+        closest_ids = {match["id"] for _, match, _, _ in closest}
+        for candidate, match, label, match_kind in fallback_matches:
             if match["id"] in closest_ids:
                 rejections.append(
-                    f"{label}: accepted as closest Wine-prefix ancestor "
+                    f"{label}: accepted as closest {match_kind} "
                     f"(target={wanted!r}, candidate={candidate!r})")
             else:
                 rejections.append(
-                    f"{label}: rejected (a closer Wine-prefix ancestor "
+                    f"{label}: rejected (a closer supported directory "
                     f"matches target={wanted!r}; candidate={candidate!r})")
     else:
         matches = []
@@ -422,22 +443,25 @@ def discover_lutris_games(client_dir: str) -> dict:
             log(f"[Lutris] Discovery command failed with exit code "
                 f"{result.returncode}{f': {detail}' if detail else '.'}", "err")
             raise RuntimeError(message)
+        diagnostics = []
         matches = matching_lutris_games(
-            result.stdout, client_dir)
+            result.stdout, client_dir, diagnostics)
         if len(matches) == 1:
             game = matches[0]
-            match_kind = (
-                "exact directory"
-                if _normalized_real_path(game["directory"]) == normalized
-                else "Wine prefix"
-            )
+            match_kind = _lutris_directory_match_kind(
+                _normalized_real_path(game["directory"]), normalized)
             log(f'[Lutris] Matched "{game["name"]}" (ID {game["id"]}) '
                 f"via {match_kind}.", "ok")
         elif len(matches) > 1:
             log(f"[Lutris] Found {len(matches)} matching entries; "
                 "choose which one PLAY should use.", "acct")
         else:
-            log(f"[Lutris] No matching Wine entry for {normalized}.", "dim")
+            detail = (
+                f" Candidate check: {_bounded_log_detail(diagnostics[0])}."
+                if diagnostics else ""
+            )
+            log(f"[Lutris] No matching Wine entry for {normalized}.{detail}",
+                "dim")
         return {"status": "ready", "matches": matches, "lutris": lutris}
     except subprocess.TimeoutExpired:
         error = f"Lutris discovery timed out after {LUTRIS_TIMEOUT}s"
@@ -6792,7 +6816,8 @@ class OctoUpdaterApp(tk.Tk):
             "Launching the game",
             "Octo Updater can use an existing Wine-runner Lutris entry whose "
             "game directory matches this game folder or is its closest Wine "
-            "prefix containing drive_c:\n\n"
+            "prefix containing drive_c. It also recognizes the split layout "
+            "<game root>/client and <game root>/wine:\n\n"
             f"{client_dir}\n\n"
             "Separately, verify Lutris is configured to launch "
             f"{exe_lbl}. VanillaFixes.exe is required to load "

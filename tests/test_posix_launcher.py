@@ -162,6 +162,67 @@ class LutrisMatchingTests(unittest.TestCase):
 
         self.assertEqual(matches, [])
 
+    def test_matches_separate_client_and_wine_sibling_layout(self):
+        with tempfile.TemporaryDirectory() as game_root:
+            client_dir = os.path.join(game_root, "client")
+            wine_dir = os.path.join(game_root, "wine")
+            os.makedirs(client_dir)
+            os.makedirs(wine_dir)
+            games = [{
+                "id": 4,
+                "name": "Wrath",
+                "runner": "wine",
+                "directory": wine_dir,
+            }]
+
+            matches = octo_updater.matching_lutris_games(
+                json.dumps(games), client_dir)
+
+        self.assertEqual([game["id"] for game in matches], ["4"])
+
+    def test_matches_game_root_for_separate_client_and_wine_layout(self):
+        with tempfile.TemporaryDirectory() as game_root:
+            client_dir = os.path.join(game_root, "client")
+            os.makedirs(client_dir)
+            os.makedirs(os.path.join(game_root, "wine"))
+            games = [{
+                "id": 4,
+                "name": "Wrath",
+                "runner": "wine",
+                "directory": game_root,
+            }]
+
+            matches = octo_updater.matching_lutris_games(
+                json.dumps(games), client_dir)
+
+        self.assertEqual([game["id"] for game in matches], ["4"])
+
+    def test_rejects_arbitrary_sibling_and_missing_wine_layout(self):
+        with tempfile.TemporaryDirectory() as game_root:
+            client_dir = os.path.join(game_root, "client")
+            os.makedirs(client_dir)
+            other_dir = os.path.join(game_root, "prefix")
+            os.makedirs(other_dir)
+            games = [
+                {
+                    "id": 4,
+                    "name": "Arbitrary sibling",
+                    "runner": "wine",
+                    "directory": other_dir,
+                },
+                {
+                    "id": 5,
+                    "name": "Root without wine",
+                    "runner": "wine",
+                    "directory": game_root,
+                },
+            ]
+
+            matches = octo_updater.matching_lutris_games(
+                json.dumps(games), client_dir)
+
+        self.assertEqual(matches, [])
+
 
 class LutrisDiscoveryTests(unittest.TestCase):
     @staticmethod
@@ -281,10 +342,12 @@ class LutrisDiscoveryTests(unittest.TestCase):
         self.assertEqual(result["status"], "ready")
         self.assertEqual(result["matches"], [])
         messages = self._messages(logger)
-        self.assertEqual(
-            messages,
+        self.assertIn(
             "[Lutris] No matching Wine entry for /games/OctoWoW.",
+            messages,
         )
+        self.assertIn("Candidate check:", messages)
+        self.assertEqual(logger.call_count, 1)
 
     def test_accepts_prefix_root_without_output_script_probe(self):
         client_dir = "/games/wrath/drive_c/world_of_warcraft"
@@ -319,6 +382,37 @@ class LutrisDiscoveryTests(unittest.TestCase):
         self.assertEqual(
             messages,
             '[Lutris] Matched "Wrath" (ID 4) via Wine prefix.',
+        )
+
+    def test_accepts_separate_client_and_wine_layout(self):
+        with tempfile.TemporaryDirectory() as game_root:
+            client_dir = os.path.join(game_root, "client")
+            wine_dir = os.path.join(game_root, "wine")
+            os.makedirs(client_dir)
+            os.makedirs(wine_dir)
+            payload = json.dumps([{
+                "id": 4,
+                "name": "Wrath",
+                "runner": "wine",
+                "directory": wine_dir,
+            }])
+            completed = subprocess.CompletedProcess(
+                ["lutris"], 0, payload, "")
+            with mock.patch.object(
+                    octo_updater.shutil, "which",
+                    return_value="/usr/bin/lutris"), \
+                    mock.patch.object(
+                        octo_updater.subprocess, "run",
+                        return_value=completed) as run, \
+                    mock.patch.object(octo_updater, "log") as logger:
+                result = octo_updater.discover_lutris_games(client_dir)
+
+        self.assertEqual([game["id"] for game in result["matches"]], ["4"])
+        self.assertNotIn("--output-script", run.call_args.args[0])
+        self.assertEqual(
+            self._messages(logger),
+            '[Lutris] Matched "Wrath" (ID 4) via '
+            'separate client/Wine layout.',
         )
 
     def test_logs_unexpected_json_shape(self):
