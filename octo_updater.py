@@ -1675,6 +1675,26 @@ MODS_REGISTRY = [
         "installed_files": ["VfPatcher.dll", "VanillaFixes.exe"],
     },
     {
+        "id":          "OctoLogin",
+        "essential": False,
+        "name":        "OctoLogin",
+        "description": "Provides OctoWoW login and world-server selection inside the game client.",
+        "repo_url":    "https://github.com/fmustafayaman/OctoLogin",
+        "source": {
+            "kind":          "github_release",
+            "owner":         "fmustafayaman",
+            "repo":          "OctoLogin",
+            "asset_pattern": "OctoLogin.dll",
+            "prefer_no":     None,
+            "extract_map":   None,
+        },
+        "register_dll":    "OctoLogin.dll",
+        "installed_files": ["OctoLogin.dll"],
+        "related_files":   ["OctoLogin.ini", "OctoLogin.log"],
+        "detect_hook":      "octologin",
+        "transaction_hook": "octologin",
+    },
+    {
         "id":          "ClassicAPI",
         "essential": True,
         "name":        "ClassicAPI",
@@ -2011,9 +2031,16 @@ def _slim_release(rel: dict) -> dict:
     """Reduce an API release object to the fields the updater actually uses,
     so the persisted cache stays small."""
     return {
+        "id": rel.get("id"),
         "tag_name": rel.get("tag_name"),
-        "assets": [{"name": a.get("name"),
+        "draft": bool(rel.get("draft", False)),
+        "prerelease": bool(rel.get("prerelease", False)),
+        "published_at": rel.get("published_at"),
+        "assets": [{"id": a.get("id"),
+                    "name": a.get("name"),
                     "size": a.get("size", 0),
+                    "content_type": a.get("content_type"),
+                    "digest": a.get("digest"),
                     "browser_download_url": a.get("browser_download_url")}
                    for a in rel.get("assets", [])],
     }
@@ -2029,16 +2056,19 @@ def _fetch_release_cached(mod: dict, force: bool = False) -> dict | None:
         return None
     mid = mod["id"]
     now = time.time()
+    stale_release = None
     if not force:
         entry = load_config().get("mod_release_cache", {}).get(mid)
-        if entry and (now - entry.get("timestamp", 0)) < _MOD_VERSION_CACHE_TTL:
-            return entry.get("release")
+        if entry:
+            stale_release = entry.get("release")
+            if (now - entry.get("timestamp", 0)) < _MOD_VERSION_CACHE_TTL:
+                return stale_release
     if kind == "github_release":
         rel = _github_latest(src["owner"], src["repo"])
     else:
         rel = _codeberg_latest(src["owner"], src["repo"])
     if rel is None:
-        return None
+        return stale_release
     rel = _slim_release(rel)
     update_config(lambda c: c.setdefault("mod_release_cache", {}).__setitem__(
         mid, {"timestamp": now, "release": rel}))
@@ -2056,9 +2086,483 @@ def fetch_mod_latest_version_cached(mod: dict, force: bool = False) -> str | Non
     return None
 
 
+OCTOLOGIN_ID = "OctoLogin"
+OCTOLOGIN_DLL = "OctoLogin.dll"
+OCTOLOGIN_MAX_BYTES = 10 * 1024 * 1024
+_OCTOLOGIN_VERSION_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
+
+
+def _normalized_semver(value: str | None) -> str | None:
+    match = _OCTOLOGIN_VERSION_RE.fullmatch((value or "").strip())
+    if not match:
+        return None
+    return ".".join(match.groups())
+
+
+def _asset_sha256(asset: dict) -> str | None:
+    digest = asset.get("digest")
+    if not isinstance(digest, str):
+        return None
+    match = re.fullmatch(r"sha256:([0-9a-fA-F]{64})", digest.strip())
+    return match.group(1).lower() if match else None
+
+
+def _validated_octologin_release(rel: dict) -> tuple[str, dict, str]:
+    if not isinstance(rel, dict):
+        raise RuntimeError("invalid OctoLogin release response")
+    if rel.get("draft") or rel.get("prerelease"):
+        raise RuntimeError("refusing draft or prerelease OctoLogin release")
+    version = _normalized_semver(rel.get("tag_name"))
+    if not version:
+        raise RuntimeError("invalid OctoLogin release tag")
+    assets = [asset for asset in rel.get("assets", [])
+              if asset.get("name") == OCTOLOGIN_DLL]
+    if len(assets) != 1:
+        raise RuntimeError("OctoLogin release must contain exactly one OctoLogin.dll asset")
+    asset = assets[0]
+    size = asset.get("size")
+    if not isinstance(size, int) or not 0 < size <= OCTOLOGIN_MAX_BYTES:
+        raise RuntimeError("invalid OctoLogin.dll asset size")
+    content_type = asset.get("content_type")
+    if content_type not in (
+            "application/x-msdownload",
+            "application/octet-stream",
+            "application/vnd.microsoft.portable-executable"):
+        raise RuntimeError("unexpected OctoLogin.dll asset content type")
+    url = asset.get("browser_download_url")
+    if not isinstance(url, str):
+        raise RuntimeError("missing OctoLogin.dll download URL")
+    _check_url(url, ALLOWED_DOWNLOAD_HOSTS)
+    digest = _asset_sha256(asset)
+    if not digest:
+        raise RuntimeError("OctoLogin.dll release has no trustworthy SHA-256 digest")
+    return version, asset, digest
+
+
+def _github_releases(owner: str, repo: str, raise_errors=False) -> list:
+    """Fetch all public releases, following GitHub's Link pagination."""
+    url = f"{GITHUB_API}/repos/{owner}/{repo}/releases?per_page=100"
+    releases = []
+    try:
+        while url:
+            req = urllib.request.Request(url, headers={"User-Agent": UA})
+            with secure_urlopen(
+                    req, timeout=10,
+                    allowed_hosts={"api.github.com"}) as response:
+                page = json.load(response)
+                if not isinstance(page, list):
+                    raise RuntimeError("invalid GitHub releases response")
+                releases.extend(page)
+                link = response.headers.get("Link", "")
+            next_url = None
+            for part in link.split(","):
+                match = re.match(r'\s*<([^>]+)>;\s*rel="([^"]+)"', part)
+                if match and match.group(2) == "next":
+                    next_url = match.group(1)
+                    break
+            url = next_url
+        return releases
+    except Exception as e:
+        if raise_errors:
+            if isinstance(e, RuntimeError):
+                raise
+            raise RuntimeError(_describe_net_error(e)) from e
+        return []
+
+
+def _octologin_release_history(force: bool = False) -> list[dict]:
+    now = time.time()
+    key = "octologin_release_history"
+    stale_releases = []
+    if not force:
+        entry = load_config().get("mod_release_history_cache", {}).get(key)
+        if entry:
+            releases = entry.get("releases")
+            if isinstance(releases, list):
+                stale_releases = releases
+                if (now - entry.get("timestamp", 0)) < _MOD_VERSION_CACHE_TTL:
+                    return releases
+    releases = []
+    for rel in _github_releases("fmustafayaman", "OctoLogin"):
+        slim = _slim_release(rel)
+        try:
+            _validated_octologin_release(slim)
+        except RuntimeError:
+            continue
+        releases.append(slim)
+    if releases:
+        update_config(
+            lambda c: c.setdefault("mod_release_history_cache", {}).__setitem__(
+                key, {"timestamp": now, "releases": releases}))
+        return releases
+    return stale_releases
+
+
+def _validate_pe_dll(data: bytes):
+    if len(data) < 0x40 or data[:2] != b"MZ":
+        raise RuntimeError("OctoLogin.dll is not a valid PE file")
+    pe_offset = struct.unpack_from("<I", data, 0x3c)[0]
+    if pe_offset < 0x40 or pe_offset + 24 > len(data):
+        raise RuntimeError("OctoLogin.dll has an invalid PE header")
+    if data[pe_offset:pe_offset + 4] != b"PE\0\0":
+        raise RuntimeError("OctoLogin.dll has an invalid PE signature")
+    machine, _sections, _time, _symbols, _symbol_count, _optional_size, characteristics = \
+        struct.unpack_from("<HHIIIHH", data, pe_offset + 4)
+    if machine != 0x14c:
+        raise RuntimeError("OctoLogin.dll is not a 32-bit x86 binary")
+    if not characteristics & 0x2000:
+        raise RuntimeError("OctoLogin.dll is not marked as a DLL")
+
+
+def _pe_string_value(data: bytes, key: str) -> str | None:
+    """Read a VERSIONINFO string without loading or executing the PE file."""
+    encoded = (key + "\0").encode("utf-16le")
+    start = data.find(encoded)
+    if start < 0:
+        return None
+    pos = start + len(encoded)
+    pos = (pos + 3) & ~3
+    while pos + 1 < len(data) and data[pos:pos + 2] == b"\0\0":
+        pos += 2
+    end = pos
+    while end + 1 < len(data) and data[end:end + 2] != b"\0\0":
+        end += 2
+    if end <= pos:
+        return None
+    try:
+        return data[pos:end].decode("utf-16le").strip()
+    except UnicodeDecodeError:
+        return None
+
+
+def octologin_pe_version(data: bytes) -> str | None:
+    _validate_pe_dll(data)
+    for key in ("ProductVersion", "FileVersion"):
+        version = _normalized_semver(_pe_string_value(data, key))
+        if version:
+            return version
+    return None
+
+
+def _read_dlls_txt(client_dir: str) -> list[str]:
+    path = _dlls_txt_path(client_dir)
+    if not os.path.exists(path):
+        return []
+    data = Path(path).read_bytes()
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")) or b"\0" in data:
+        raise RuntimeError("dlls.txt uses an unsupported UTF-16 encoding")
+    try:
+        return data.decode("utf-8").splitlines()
+    except UnicodeDecodeError as e:
+        raise RuntimeError("dlls.txt is not valid UTF-8 text") from e
+
+
+def _is_octologin_dll_line(line: str) -> bool:
+    normalized = line.strip().replace("\\", "/").lower()
+    return bool(normalized) and normalized.rsplit("/", 1)[-1] == "octologin.dll"
+
+
+def _octologin_registered(client_dir: str) -> tuple[bool, bool]:
+    matches = [line.strip() for line in _read_dlls_txt(client_dir)
+               if _is_octologin_dll_line(line)]
+    canonical = [line for line in matches if line.lower() == OCTOLOGIN_DLL.lower()]
+    return len(canonical) == 1 and len(matches) == 1, bool(matches)
+
+
+def _octologin_hash_versions(releases: list[dict]) -> dict[str, str]:
+    versions = {}
+    for release in releases:
+        try:
+            version, _asset, digest = _validated_octologin_release(release)
+        except RuntimeError:
+            continue
+        versions[digest] = version
+    return versions
+
+
+def detect_octologin_state(client_dir: str, saved_state: dict | None = None,
+                           releases: list[dict] | None = None) -> dict:
+    saved_state = saved_state or {}
+    dll_path = os.path.join(client_dir, OCTOLOGIN_DLL)
+    related_present = [
+        name for name in ("OctoLogin.ini", "OctoLogin.log")
+        if os.path.exists(os.path.join(client_dir, name))
+    ]
+    try:
+        canonical_registration, any_registration = _octologin_registered(client_dir)
+    except RuntimeError as e:
+        canonical_registration, any_registration = False, True
+        registration_error = str(e)
+    else:
+        registration_error = None
+
+    if not os.path.exists(dll_path):
+        if any_registration or saved_state.get("enabled") or related_present:
+            detail = ("OctoLogin.dll is missing; retry to repair the installation"
+                      if not related_present else
+                      "OctoLogin.dll is missing but OctoLogin configuration or log files remain")
+            return {
+                **saved_state,
+                "enabled": True,
+                "installed_version": None,
+                "installed_sha256": None,
+                "installed_files": related_present,
+                "detection_source": "missing",
+                "status": "broken",
+                "error": registration_error or detail,
+            }
+        return {
+            **saved_state,
+            "enabled": False,
+            "installed_version": None,
+            "installed_sha256": None,
+            "installed_files": [],
+            "detection_source": None,
+            "status": "not_installed",
+            "error": None,
+        }
+
+    try:
+        data = Path(dll_path).read_bytes()
+        _validate_pe_dll(data)
+    except (OSError, RuntimeError) as e:
+        return {
+            **saved_state,
+            "enabled": True,
+            "installed_version": None,
+            "installed_sha256": None,
+            "installed_files": [OCTOLOGIN_DLL],
+            "detection_source": "invalid",
+            "status": "broken",
+            "error": f"Invalid OctoLogin.dll: {e}",
+        }
+
+    digest = hashlib.sha256(data).hexdigest()
+    embedded = octologin_pe_version(data)
+    hash_version = _octologin_hash_versions(releases or []).get(digest)
+    recorded_version = None
+    if (saved_state.get("installed_sha256") == digest
+            and _normalized_semver(saved_state.get("installed_version"))):
+        recorded_version = _normalized_semver(saved_state["installed_version"])
+    version = embedded or hash_version or recorded_version
+    source = ("pe_version" if embedded else
+              "release_digest" if hash_version else
+              "updater_record" if recorded_version else "unknown")
+
+    error = registration_error
+    if not error and not canonical_registration:
+        error = ("dlls.txt is missing the canonical OctoLogin.dll entry"
+                 if not any_registration else
+                 "dlls.txt contains a non-canonical or duplicate OctoLogin entry")
+    vf_ready = all(os.path.exists(os.path.join(client_dir, name))
+                   for name in ("VanillaFixes.exe", "VfPatcher.dll"))
+    if not error and not vf_ready:
+        error = "VanillaFixes is required to load OctoLogin.dll"
+
+    return {
+        **saved_state,
+        "enabled": True,
+        "installed_version": version,
+        "installed_sha256": digest,
+        "installed_files": [OCTOLOGIN_DLL],
+        "detection_source": source,
+        "status": "broken" if error else
+                  ("installed" if version else "installed_unknown"),
+        "error": error,
+    }
+
+
+def octologin_platform_note(platform: str | None = None) -> str:
+    platform = sys.platform if platform is None else platform
+    if platform.startswith("linux"):
+        return " Recommended on Linux for current OctoWoW connectivity."
+    return ""
+
+
+def mod_description(mod: dict, platform: str | None = None) -> str:
+    description = mod["description"]
+    if mod["id"] == OCTOLOGIN_ID:
+        description += octologin_platform_note(platform)
+    return description
+
+
+def _octologin_dlls_bytes(client_dir: str, enabled: bool) -> bytes | None:
+    lines = _read_dlls_txt(client_dir)
+    kept = [line for line in lines if not _is_octologin_dll_line(line)]
+    if enabled:
+        kept.append(OCTOLOGIN_DLL)
+    if not kept:
+        return None
+    return ("\n".join(kept) + "\n").encode("utf-8")
+
+
+def _replace_with_backup(path: str, replacement: str | None,
+                         token: str) -> tuple[str | None, bool]:
+    backup = f"{path}.octologin-backup-{token}" if os.path.exists(path) else None
+    if backup:
+        os.replace(path, backup)
+    try:
+        if replacement is not None:
+            os.replace(replacement, path)
+        return backup, replacement is not None
+    except BaseException:
+        if backup and os.path.exists(backup):
+            os.replace(backup, path)
+        raise
+
+
+def _restore_replacement(path: str, backup: str | None, installed: bool):
+    if installed and os.path.exists(path):
+        os.remove(path)
+    if backup and os.path.exists(backup):
+        os.replace(backup, path)
+
+
+def install_octologin(client_dir: str, release: dict) -> tuple[list, str, str]:
+    import secrets
+    version, asset, expected_digest = _validated_octologin_release(release)
+    token = secrets.token_hex(8)
+    dll_path = os.path.join(client_dir, OCTOLOGIN_DLL)
+    dll_tmp = os.path.join(client_dir, f".OctoLogin.dll.download-{token}")
+    dlls_path = _dlls_txt_path(client_dir)
+    dlls_tmp = os.path.join(client_dir, f".dlls.txt.octologin-{token}")
+    dll_backup = dlls_backup = None
+    dll_installed = dlls_installed = False
+    try:
+        log(f"  Downloading {OCTOLOGIN_DLL} ({asset['size']//1024} KB)...")
+        request = urllib.request.Request(
+            asset["browser_download_url"], headers={"User-Agent": UA})
+        digest = hashlib.sha256()
+        total = 0
+        with secure_urlopen(request, timeout=120,
+                            allowed_hosts=ALLOWED_DOWNLOAD_HOSTS) as response, \
+                open(dll_tmp, "wb") as output:
+            while True:
+                chunk = response.read(64 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > OCTOLOGIN_MAX_BYTES:
+                    raise RuntimeError("OctoLogin.dll download exceeds the size limit")
+                digest.update(chunk)
+                output.write(chunk)
+            output.flush()
+            os.fsync(output.fileno())
+        if total != asset["size"]:
+            raise RuntimeError(
+                f"OctoLogin.dll size mismatch (expected {asset['size']}, got {total})")
+        actual_digest = digest.hexdigest()
+        if actual_digest != expected_digest:
+            raise RuntimeError("OctoLogin.dll checksum verification failed")
+        data = Path(dll_tmp).read_bytes()
+        embedded = octologin_pe_version(data)
+        if embedded and embedded != version:
+            raise RuntimeError(
+                f"OctoLogin.dll version {embedded} does not match release {version}")
+
+        dlls_bytes = _octologin_dlls_bytes(client_dir, enabled=True)
+        with open(dlls_tmp, "wb") as output:
+            output.write(dlls_bytes or b"")
+            output.flush()
+            os.fsync(output.fileno())
+
+        dll_backup, dll_installed = _replace_with_backup(
+            dll_path, dll_tmp, token)
+        dlls_backup, dlls_installed = _replace_with_backup(
+            dlls_path, dlls_tmp, token)
+        if sha256_file(dll_path) != expected_digest:
+            raise RuntimeError("installed OctoLogin.dll failed post-write verification")
+        for backup in (dll_backup, dlls_backup):
+            try:
+                if backup and os.path.exists(backup):
+                    os.remove(backup)
+            except OSError:
+                log(f"  Warning: could not remove transaction backup {backup}")
+        dll_backup = dlls_backup = None
+        log(f"  Installed {OCTOLOGIN_DLL}")
+        return [OCTOLOGIN_DLL], version, expected_digest
+    except BaseException:
+        _restore_replacement(dlls_path, dlls_backup, dlls_installed)
+        _restore_replacement(dll_path, dll_backup, dll_installed)
+        raise
+    finally:
+        for path in (dll_tmp, dlls_tmp):
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except OSError:
+                pass
+
+
+def uninstall_octologin(client_dir: str):
+    import secrets
+    token = secrets.token_hex(8)
+    dlls_path = _dlls_txt_path(client_dir)
+    dlls_tmp = os.path.join(client_dir, f".dlls.txt.octologin-{token}")
+    staged = []
+    dlls_backup = None
+    dlls_installed = False
+    try:
+        dlls_bytes = _octologin_dlls_bytes(client_dir, enabled=False)
+        if dlls_bytes is not None:
+            with open(dlls_tmp, "wb") as output:
+                output.write(dlls_bytes)
+                output.flush()
+                os.fsync(output.fileno())
+            dlls_replacement = dlls_tmp
+        else:
+            dlls_replacement = None
+
+        for name in (OCTOLOGIN_DLL, "OctoLogin.ini", "OctoLogin.log"):
+            path = os.path.join(client_dir, name)
+            if not os.path.exists(path):
+                continue
+            backup = f"{path}.octologin-remove-{token}"
+            os.replace(path, backup)
+            staged.append((path, backup))
+
+        dlls_backup, dlls_installed = _replace_with_backup(
+            dlls_path, dlls_replacement, token)
+        for _path, backup in staged:
+            try:
+                os.remove(backup)
+            except OSError:
+                log(f"  Warning: could not remove transaction backup {backup}")
+        staged = []
+        try:
+            if dlls_backup and os.path.exists(dlls_backup):
+                os.remove(dlls_backup)
+        except OSError:
+            log(f"  Warning: could not remove transaction backup {dlls_backup}")
+        dlls_backup = None
+    except BaseException:
+        _restore_replacement(dlls_path, dlls_backup, dlls_installed)
+        for path, backup in reversed(staged):
+            if os.path.exists(backup):
+                os.replace(backup, path)
+        raise
+    finally:
+        if os.path.exists(dlls_tmp):
+            os.remove(dlls_tmp)
+
+
 def install_mod(mod: dict, client_dir: str, release: dict | None = None) -> list:
     src     = mod["source"]
     written = []
+
+    if mod.get("transaction_hook") == "octologin":
+        rel = release if release is not None else \
+            _github_latest(src["owner"], src["repo"], raise_errors=True)
+        if not rel:
+            raise RuntimeError("no release found on GitHub")
+        written, version, digest = install_octologin(client_dir, rel)
+        _version, asset, _digest = \
+            _validated_octologin_release(rel)
+        mod["_resolved_version"] = version
+        mod["_resolved_sha256"] = digest
+        mod["_resolved_release_id"] = rel.get("id")
+        mod["_resolved_asset_id"] = asset.get("id")
+        return written
 
     if src["kind"] == "codeberg_release":
         rel = release if release is not None else \
@@ -2281,6 +2785,9 @@ def install_mod(mod: dict, client_dir: str, release: dict | None = None) -> list
 
 
 def uninstall_mod(mod: dict, client_dir: str):
+    if mod.get("transaction_hook") == "octologin":
+        uninstall_octologin(client_dir)
+        return
     cfg   = load_config()
     state = cfg.get("mods", {}).get(mod["id"], {})
     files = state.get("installed_files", mod.get("installed_files", []))
@@ -2326,6 +2833,19 @@ def mod_installed_files_present(mod: dict, client_dir: str) -> bool:
         os.path.exists(os.path.join(client_dir, f)) for f in files)
 
 
+def mod_state_installed(state: dict) -> bool:
+    return bool(state.get("installed_version")
+                or state.get("status") in ("installed", "installed_unknown"))
+
+
+def mod_display_version(state: dict, live: dict | None) -> str:
+    if state.get("status") == "installed_unknown":
+        return "unknown"
+    return (state.get("installed_version")
+            or (live or {}).get("latest_version")
+            or "unknown")
+
+
 def mod_supports_update_check(mod: dict) -> bool:
     return mod["source"]["kind"] not in ("direct_file", "direct_tar")
 
@@ -2337,12 +2857,16 @@ def mod_update_available(mod: dict, state: dict, live: dict | None) -> bool:
         return False
     if state.get("ignore_updates", False):
         return False
-    installed_ver = state.get("installed_version")
+    installed_ver = _normalized_semver(state.get("installed_version"))
     if not installed_ver:
         return False
-    latest_ver = (live or {}).get("latest_version")
+    latest_ver = _normalized_semver((live or {}).get("latest_version"))
     if not latest_ver:
         return False
+    if (mod["id"] == OCTOLOGIN_ID
+            and state.get("installed_sha256")
+            and (live or {}).get("latest_sha256")):
+        return state["installed_sha256"] != live["latest_sha256"]
     return latest_ver != installed_ver
 
 
@@ -4370,7 +4894,7 @@ class OctoUpdaterApp(tk.Tk):
                 if live is not None and "ver_label" in refs:
                     # Installed mods show their installed version; others
                     # show the latest available.
-                    ver = state.get("installed_version") or live.get("latest_version") or "unknown"
+                    ver = mod_display_version(state, live)
                     refs["ver_label"].configure(text=f"  {ver}")
 
                 # Checkbox always reflects config only — never a registry default.
@@ -4382,7 +4906,7 @@ class OctoUpdaterApp(tk.Tk):
                         refs["ignore"].set(state.get("ignore_updates", False))
 
                 has_error = bool(state.get("error"))
-                installed = bool(state.get("installed_version"))
+                installed = mod_state_installed(state)
                 if "name_label" in refs:
                     refs["name_label"].configure(
                         fg=C_ERR if has_error else (C_MOD_HL if installed else C_TEXT))
@@ -4411,14 +4935,14 @@ class OctoUpdaterApp(tk.Tk):
             live  = next((m for m in self._mods_state if m["id"] == mid), {})
 
             # Installed mods show their installed version; others show latest.
-            latest_ver  = state.get("installed_version") or live.get("latest_version") or "unknown"
+            latest_ver  = mod_display_version(state, live)
             # Checkbox reflects only what's actually recorded in config — never
             # a registry default. Pending (not-yet-applied) UI changes still
             # win so an in-progress toggle survives a background re-render.
             enabled     = self._mod_pending_state.get(mid, {}).get("enabled", state.get("enabled", False))
             ignore_upd  = state.get("ignore_updates", False)
             essential   = mod.get("essential", False)
-            installed   = bool(state.get("installed_version"))
+            installed   = mod_state_installed(state)
             # Installed mods are highlighted green; the name is neutral text
             # otherwise (error state overrides to red in the refresh paths).
             name_col    = C_MOD_HL if installed else C_TEXT
@@ -4490,7 +5014,7 @@ class OctoUpdaterApp(tk.Tk):
                               l.configure(fg=getattr(l, "_base", C_GOLD)))
             self._style_mod_action_label(update_label, mod, state, live)
 
-            desc_label = tk.Label(row, text=mod["description"],
+            desc_label = tk.Label(row, text=mod_description(mod),
                                   font=("Segoe UI", 10),
                                   fg=(C_TEXT if enabled else C_TEXT_DIM),
                                   bg=C_PANEL, wraplength=self._px(400),
@@ -4521,11 +5045,51 @@ class OctoUpdaterApp(tk.Tk):
 
     def _load_mods_state(self):
         state = []
+        cfg = load_config()
+        client_dir = cfg.get("out_dir", DEFAULT_GAME_DIR)
         for mod in MODS_REGISTRY:
+            release = None
             try:
-                v = fetch_mod_latest_version_cached(mod)
+                release = (_fetch_release_cached(mod)
+                           if mod["source"]["kind"] in
+                           ("github_release", "codeberg_release") else None)
+                v = (_release_version(mod, release) if release else
+                     fetch_mod_latest_version_cached(mod))
             except Exception:
                 v = None
+
+            if mod.get("detect_hook") == "octologin":
+                latest_sha256 = None
+                try:
+                    if release:
+                        v, _asset, latest_sha256 = \
+                            _validated_octologin_release(release)
+                except RuntimeError:
+                    v = None
+                try:
+                    history = _octologin_release_history()
+                    if release:
+                        history = [release] + [
+                            item for item in history
+                            if item.get("id") != release.get("id")]
+                    detected = detect_octologin_state(
+                        client_dir,
+                        load_config().get("mods", {}).get(mod["id"], {}),
+                        history)
+                    update_config(
+                        lambda c, mid=mod["id"], value=detected:
+                        c.setdefault("mods", {}).__setitem__(mid, value))
+                except Exception:
+                    pass
+                if v and latest_sha256:
+                    state.append({
+                        "id": mod["id"],
+                        "latest_version": v,
+                        "latest_sha256": latest_sha256,
+                        "release_id": release.get("id") if release else None,
+                    })
+                continue
+
             if v:
                 state.append({"id": mod["id"], "latest_version": v})
         self._mods_state = state
@@ -4676,6 +5240,10 @@ class OctoUpdaterApp(tk.Tk):
             lbl._base, lbl._hover = C_GOLD, C_GOLD_LT
             lbl.configure(text="update", fg=C_GOLD)
             lbl.pack(side="right", padx=(self._px(2), self._px(8)))
+        elif state.get("status") == "installed_unknown":
+            lbl._base, lbl._hover = C_GOLD, C_GOLD_LT
+            lbl.configure(text="reinstall", fg=C_GOLD)
+            lbl.pack(side="right", padx=(self._px(2), self._px(8)))
         else:
             lbl.pack_forget()
 
@@ -4684,8 +5252,9 @@ class OctoUpdaterApp(tk.Tk):
         per-row "update" label). Runs through the normal apply worker so
         errors/versions are recorded exactly like a manual Apply."""
         out = self._game_path.get().strip()
-        if not out:
+        if not out or self._running:
             return
+        self._running = True
         mod = next(m for m in MODS_REGISTRY if m["id"] == mod_id)
         self._log_line(f"\nUpdating {mod['name']}...\n", "acct")
         self._set_btn_busy("Installing…")
@@ -4695,8 +5264,9 @@ class OctoUpdaterApp(tk.Tk):
 
     def _apply_mods(self):
         out = self._game_path.get().strip()
-        if not out:
+        if not out or self._running:
             return
+        self._running = True
         self._apply_btn.configure(text="Applying...", bg="#2a2a32", fg=C_TEXT_DIM)
         self._set_btn_busy("Installing…")
         self._status_var.set("Downloading mods…")
@@ -4762,8 +5332,8 @@ class OctoUpdaterApp(tk.Tk):
             return
 
         cfg = load_config()
-        if cfg.get("mods"):
-            return  # already initialized for this folder
+        if "VanillaFixes" in cfg.get("mods", {}):
+            return  # the essential-mod batch already initialized this folder
 
         out = self._game_path.get().strip()
         if not out or not os.path.exists(os.path.join(out, "WoW.exe")):
@@ -4781,6 +5351,7 @@ class OctoUpdaterApp(tk.Tk):
                 self._mod_pending_state.setdefault(mod["id"], {})["enabled"] = True
 
         self._log_line("\nInstalling essential mods...\n", "acct")
+        self._running = True
         self._set_btn_busy("Installing…")
         self._status_var.set("Downloading mods…")
         threading.Thread(target=self._apply_mods_worker,
@@ -4820,20 +5391,27 @@ class OctoUpdaterApp(tk.Tk):
                 enabled = True
 
             installed_ver = state.get("installed_version")
-            is_installed  = (bool(installed_ver) and
+            is_installed  = (mod_state_installed(state) and
                              mod_installed_files_present(mod, client_dir))
 
             needs_install   = enabled and not is_installed
-            needs_uninstall = not enabled and is_installed
+            needs_uninstall = (not enabled and
+                               (is_installed or
+                                (mod.get("transaction_hook") == "octologin"
+                                 and state.get("enabled"))))
 
             needs_version_lookup = needs_install or (enabled and is_installed and not ignore_upd)
             latest_ver  = None
+            latest_sha256 = None
             mod_release = None
             if needs_version_lookup:
                 try:
                     if mod["source"]["kind"] in ("github_release", "codeberg_release"):
                         mod_release = _fetch_release_cached(mod)
                         latest_ver  = _release_version(mod, mod_release) if mod_release else None
+                        if mod.get("transaction_hook") == "octologin" and mod_release:
+                            _version, _asset, latest_sha256 = \
+                                _validated_octologin_release(mod_release)
                     else:
                         latest_ver = fetch_mod_latest_version_cached(mod)
                 except Exception:
@@ -4841,9 +5419,18 @@ class OctoUpdaterApp(tk.Tk):
 
             update_avail = (is_installed and
                             latest_ver is not None and
-                            latest_ver != installed_ver and
+                            (_normalized_semver(latest_ver) !=
+                             _normalized_semver(installed_ver)
+                             or (latest_sha256 is not None
+                                 and state.get("installed_sha256") is not None
+                                 and latest_sha256 !=
+                                 state.get("installed_sha256"))) and
                             not ignore_upd)
             needs_update = enabled and update_avail
+            if (only_mod_id == mid and is_installed
+                    and (state.get("status") == "installed_unknown"
+                         or state.get("error"))):
+                needs_update = True
 
             if not (needs_install or needs_uninstall or needs_update):
                 if mid in pending:
@@ -4867,13 +5454,22 @@ class OctoUpdaterApp(tk.Tk):
                 if needs_install:
                     log(f"\nInstalling {mod['name']} {latest_ver}...")
                     written = install_mod(mod, client_dir, release=mod_release)
-                    if mod.get("register_dll"):
+                    if (mod.get("register_dll")
+                            and not mod.get("transaction_hook")):
                         add_dll(client_dir, mod["register_dll"])
                     resolved_ver = mod.pop("_resolved_version", None) or latest_ver or "unknown"
+                    resolved_sha = mod.pop("_resolved_sha256", None)
+                    resolved_release_id = mod.pop("_resolved_release_id", None)
+                    resolved_asset_id = mod.pop("_resolved_asset_id", None)
                     mods_cfg[mid] = {
                         "enabled":           True,
                         "installed_version": resolved_ver,
+                        "installed_sha256":  resolved_sha,
                         "installed_files":   written,
+                        "detection_source":  "release_digest" if resolved_sha else None,
+                        "installed_release_id": resolved_release_id,
+                        "installed_asset_id": resolved_asset_id,
+                        "status":             "installed",
                         "ignore_updates":    ignore_upd,
                         "error":             None,
                     }
@@ -4884,12 +5480,18 @@ class OctoUpdaterApp(tk.Tk):
                 elif needs_uninstall:
                     log(f"\nUninstalling {mod['name']}...")
                     uninstall_mod(mod, client_dir)
-                    if mod.get("register_dll"):
+                    if (mod.get("register_dll")
+                            and not mod.get("transaction_hook")):
                         remove_dll(client_dir, mod["register_dll"])
                     mods_cfg[mid] = {
                         "enabled":           False,
                         "installed_version": None,
+                        "installed_sha256":  None,
+                        "installed_release_id": None,
+                        "installed_asset_id": None,
                         "installed_files":   [],
+                        "detection_source":  None,
+                        "status":             "not_installed",
                         "ignore_updates":    ignore_upd,
                         "error":             None,
                     }
@@ -4897,14 +5499,25 @@ class OctoUpdaterApp(tk.Tk):
 
                 elif needs_update:
                     log(f"\nUpdating {mod['name']} {installed_ver} \u2192 {latest_ver}...")
-                    uninstall_mod(mod, client_dir)
+                    if not mod.get("transaction_hook"):
+                        uninstall_mod(mod, client_dir)
                     written = install_mod(mod, client_dir, release=mod_release)
-                    if mod.get("register_dll"):
+                    if (mod.get("register_dll")
+                            and not mod.get("transaction_hook")):
                         add_dll(client_dir, mod["register_dll"])
+                    resolved_ver = mod.pop("_resolved_version", None) or latest_ver
+                    resolved_sha = mod.pop("_resolved_sha256", None)
+                    resolved_release_id = mod.pop("_resolved_release_id", None)
+                    resolved_asset_id = mod.pop("_resolved_asset_id", None)
                     mods_cfg[mid] = {
                         "enabled":           True,
-                        "installed_version": latest_ver,
+                        "installed_version": resolved_ver,
+                        "installed_sha256":  resolved_sha,
                         "installed_files":   written,
+                        "detection_source":  "release_digest" if resolved_sha else None,
+                        "installed_release_id": resolved_release_id,
+                        "installed_asset_id": resolved_asset_id,
+                        "status":             "installed",
                         "ignore_updates":    ignore_upd,
                         "error":             None,
                     }
@@ -4915,13 +5528,20 @@ class OctoUpdaterApp(tk.Tk):
             except Exception as e:
                 err = describe_install_error(e)
                 log(f"  \u2717 {mod['name']}: {err}")
-                mods_cfg[mid] = {
-                    "enabled":           False,
-                    "installed_version": None,
-                    "installed_files":   [],
-                    "ignore_updates":    ignore_upd,
-                    "error":             err,
-                }
+                if mod.get("detect_hook") == "octologin":
+                    detected = detect_octologin_state(
+                        client_dir, state, _octologin_release_history())
+                    detected["ignore_updates"] = ignore_upd
+                    detected["error"] = err
+                    mods_cfg[mid] = detected
+                else:
+                    mods_cfg[mid] = {
+                        "enabled":           False,
+                        "installed_version": None,
+                        "installed_files":   [],
+                        "ignore_updates":    ignore_upd,
+                        "error":             err,
+                    }
 
         # Merge just the "mods" key into the current on-disk config (which
         # other threads may have written to during this long install), rather
@@ -4940,6 +5560,7 @@ class OctoUpdaterApp(tk.Tk):
             self._mod_pending_state = {}
 
         def _do_inplace_update():
+            self._running = False
             for mod in MODS_REGISTRY:
                 mid         = mod["id"]
                 state       = fresh_mods.get(mid, {})
@@ -4947,14 +5568,14 @@ class OctoUpdaterApp(tk.Tk):
                 if not refs:
                     continue
                 has_error   = bool(state.get("error"))
-                installed   = bool(state.get("installed_version"))
+                installed   = mod_state_installed(state)
 
                 if mid not in self._mod_pending_state:
                     refs["enabled"].set(state.get("enabled", False))
                     refs["ignore"].set(state.get("ignore_updates", False))
 
                 live = next((m for m in self._mods_state if m["id"] == mid), {})
-                ver  = state.get("installed_version") or live.get("latest_version") or "unknown"
+                ver  = mod_display_version(state, live)
                 if "ver_label" in refs:
                     refs["ver_label"].configure(text=f"  {ver}")
 
@@ -6469,6 +7090,7 @@ class OctoUpdaterApp(tk.Tk):
         if not pending:
             return
         self._log_line("\nInstalling essential mods...\n", "acct")
+        self._running = True
         self._set_btn_busy("Installing…")
         self._status_var.set("Downloading mods…")
         threading.Thread(target=self._apply_mods_worker,
@@ -6968,7 +7590,7 @@ class OctoUpdaterApp(tk.Tk):
             self._maybe_install_essential_mods()
             # When mods were already initialized, the addons chain from
             # _do_inplace_update never runs — trigger it directly.
-            if load_config().get("mods"):
+            if "VanillaFixes" in load_config().get("mods", {}):
                 self._maybe_install_default_addons()
         else:
             self._client_ready = False
@@ -6997,7 +7619,7 @@ class OctoUpdaterApp(tk.Tk):
                     # the client but has never had mods installed via this
                     # updater.
                     self._maybe_install_essential_mods()
-                    if load_config().get("mods"):
+                    if "VanillaFixes" in load_config().get("mods", {}):
                         self._maybe_install_default_addons()
                 elif msg == "__UPDATE_NEEDED__":
                     self._running = False

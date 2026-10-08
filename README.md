@@ -32,6 +32,7 @@ Codeberg releases and registered in `dlls.txt`:
 | DXVK                    | Vulkan-based rendering for better performance                                       |
 | Nampower                | Reduces input lag on higher latency; expands the addon API                          |
 | No1600x1200             | Fixes incorrect resolution when the monitor's native res isn't detected (optional) |
+| OctoLogin               | Provides OctoWoW login and world-server selection inside the client (optional)     |
 | SuperWoW                | Backported client API features; required by some addons                            |
 | TransmogFix             | Fixes transmog-related frame drops on character death                              |
 | UnitXP_SP3              | Frame limiter, improved targeting, anti-aliased combat text, and more              |
@@ -42,6 +43,15 @@ Codeberg releases and registered in `dlls.txt`:
 - Essential mods auto-install on a fresh game folder, or on any game
   folder when **Install essential mods** is enabled in Settings.
 - Per-mod **update** / **retry** actions and an update-count badge on the tab.
+- OctoLogin is optional on every platform and is highlighted as recommended on
+  Linux. Octo Updater installs its DLL in the client root and registers
+  `OctoLogin.dll` in `dlls.txt`, following the updater's existing root-level
+  mod convention rather than upstream's `mods/` installer layout.
+- OctoLogin versions are detected from embedded PE version metadata when
+  available, then from verified release hashes. A valid manual install whose
+  version cannot be identified is shown as unknown and can be reinstalled.
+  Updating preserves `OctoLogin.ini` and `OctoLogin.log`; removing the mod
+  deletes the DLL, INI and log.
 - When VanillaFixes is installed, **PLAY** launches through it instead of
   `WoW.exe` directly. On native Linux, Octo Updater asks Lutris to launch the
   selected registered game; verify Lutris uses `VanillaFixes.exe` when needed.
@@ -98,6 +108,11 @@ verification/updates.
 
 - Hardened TLS (system trust store, hostname check, TLS 1.2+ floor).
 - HTTPS-only with per-host allowlists for all downloads; redirects stay HTTPS.
+- OctoLogin downloads use the release's bare DLL asset, verify GitHub's
+  API-provided SHA-256 digest and PE structure before installation, and replace
+  the DLL plus `dlls.txt` transactionally with rollback. The upstream release
+  has no detached signature or author-published checksum, so this still trusts
+  the repository owner's GitHub account and GitHub's release metadata.
 - On Windows, `aria2c` is fetched once and SHA-256-verified before it's ever
   run. Native Linux/macOS runs use the system-installed executable.
 - Atomic config writes (temp + rename) with a lock — safe against concurrent
